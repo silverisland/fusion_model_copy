@@ -57,59 +57,6 @@ class SoftMoELayer(nn.Module):
         out = torch.matmul(combine_weights, slots_output) # (B, N, D)
         return out
 
-class DeepFlattenMapper(nn.Module):
-    """
-    Advanced mapper that uses a bottleneck MLP to align expert outputs.
-    Adds non-linear capacity (GELU) and regularization (Dropout).
-    """
-    def __init__(self, input_dim, output_dim, dropout=0.2):
-        super().__init__()
-        # Use a hidden dimension that balances capacity and compression
-        hidden_dim = max(input_dim // 4, output_dim * 2)
-        
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, output_dim),
-            nn.LayerNorm(output_dim)
-        )
-
-    def forward(self, x):
-        # x shape: (B, C, D) or (B, C, P, D)
-        if x.dim() == 4:
-            B, C, P, D = x.shape
-            x = x.reshape(B, C, -1) # (B, C, P*D)
-        
-        return self.net(x)
-
-class MultiHeadPredictor(nn.Module):
-    """
-    Inspired by TabM's multi-hypothesis ensemble. 
-    Uses multiple independent heads to generate predictions.
-    Training: returns (n_heads, B, Q, P)
-    Inference: returns (B, Q, P) via averaging
-    """
-    def __init__(self, d_fusion, pred_len, n_heads=4, dropout=0.2):
-        super().__init__()
-        self.heads = nn.ModuleList([
-            nn.Sequential(
-                nn.Dropout(dropout),
-                nn.Linear(d_fusion, pred_len)
-            ) for _ in range(n_heads)
-        ])
-        
-    def forward(self, x):
-        # x: (B, num_queries, d_fusion)
-        # Stack predictions from all heads: (n_heads, B, num_queries, pred_len)
-        preds = torch.stack([head(x) for head in self.heads], dim=0)
-        
-        if self.training:
-            return preds
-        else:
-            # Average across heads to get the final robust prediction
-            return preds.mean(dim=0)
-
 class QueryGenerator(nn.Module):
     """
     Dynamically generates queries based on input data statistics (Mean, Std, Max, Min).
@@ -145,18 +92,79 @@ class QueryGenerator(nn.Module):
         queries = self.generator(stats) # (B, num_queries * d_fusion)
         return queries.view(B, self.num_queries, self.d_fusion)
 
+class CrossAttnMapper(nn.Module):
+    """
+    Expert-specific mapper that uses a fixed number of queries (dynamic or static)
+    to aggregate information from the expert's hidden states.
+    """
+    def __init__(self, in_dim, d_fusion, n_features, queries_per_expert=16, 
+                 use_dynamic_queries=True, num_heads=8, dropout=0.1):
+        super().__init__()
+        self.use_dynamic_queries = use_dynamic_queries
+        
+        # Feature alignment
+        self.input_proj = nn.Linear(in_dim, d_fusion)
+        
+        # Query source
+        if use_dynamic_queries:
+            self.query_gen = QueryGenerator(n_features, queries_per_expert, d_fusion)
+        else:
+            self.static_queries = nn.Parameter(torch.randn(1, queries_per_expert, d_fusion) * 0.02)
+        
+        self.cross_attn = nn.MultiheadAttention(d_fusion, num_heads=num_heads, batch_first=True)
+        self.norm = nn.LayerNorm(d_fusion)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, h, x_raw=None):
+        # Handle 4D or 3D expert outputs
+        if h.dim() == 4:
+            B, C, P, D = h.shape
+            h = h.reshape(B, C * P, D)
+        
+        B, N, D = h.shape
+        h_proj = self.input_proj(h)
+        
+        # Generate Queries
+        if self.use_dynamic_queries:
+            q = self.query_gen(x_raw)
+        else:
+            q = self.static_queries.expand(B, -1, -1)
+            
+        # Distill information
+        attn_out, _ = self.cross_attn(q, h_proj, h_proj)
+        return self.norm(q + self.dropout(attn_out))
+
+class MultiHeadPredictor(nn.Module):
+    """
+    Inspired by TabM's multi-hypothesis ensemble. 
+    Uses multiple independent heads to generate predictions.
+    """
+    def __init__(self, d_fusion, pred_len, n_heads=4, dropout=0.2):
+        super().__init__()
+        self.heads = nn.ModuleList([
+            nn.Sequential(
+                nn.Dropout(dropout),
+                nn.Linear(d_fusion, pred_len)
+            ) for _ in range(n_heads)
+        ])
+        
+    def forward(self, x):
+        preds = torch.stack([head(x) for head in self.heads], dim=0)
+        if self.training:
+            return preds
+        else:
+            return preds.mean(dim=0)
+
 class FusionModel(nn.Module):
     """
-    Channel-Centric Fusion Architecture:
-    1. Experts output (B, C, D) -> Time is embedded into D.
-    2. TokenPacker uses C queries (Static or Dynamic) to aggregate features.
-    3. Soft MoE performs differentiable expert fusion per channel token.
-    4. Prediction head outputs final values in target space.
+    Hierarchical Fusion Architecture:
+    1. Each expert uses a CrossAttnMapper to distill information into K queries.
+    2. Queries are concatenated across all experts (M * K tokens).
+    3. Soft MoE performs cross-expert fusion on these balanced tokens.
     """
     def __init__(self, models_dict, seq_len, pred_len, n_features, 
-                 num_queries=None, d_fusion=256, num_experts=4, device='cpu', 
-                 query_init_type='orthogonal', use_dynamic_queries=True,
-                 dropout=0.1):
+                 queries_per_expert=16, d_fusion=256, num_experts=4, device='cpu', 
+                 use_dynamic_queries=True, dropout=0.1):
         super().__init__()
         self.models_dict = nn.ModuleDict(models_dict)
         self.device = device
@@ -164,147 +172,79 @@ class FusionModel(nn.Module):
         self.n_features = n_features
         self.use_dynamic_queries = use_dynamic_queries
         self.dropout_rate = dropout
+        self.queries_per_expert = queries_per_expert
 
-        # Use n_features as default num_queries for channel-specific fusion
-        self.num_queries = num_queries if num_queries is not None else n_features
-
-        # --- Stage 1: TokenPacker (Injection) ---
-        if self.use_dynamic_queries:
-            self.query_gen = QueryGenerator(n_features, self.num_queries, d_fusion)
-            self.queries = None
-        else:
-            self.queries = nn.Parameter(torch.empty(1, self.num_queries, d_fusion))
-            self._init_queries(query_init_type)
-
-        self.cross_attn = nn.MultiheadAttention(d_fusion, num_heads=8, batch_first=True)
-        self.norm1 = nn.LayerNorm(d_fusion)
-        
-        # Individual projectors to align base models (B, C, D_i) -> (B, C, d_fusion)
+        # Individual projectors to summarize base models
         self.projectors = nn.ModuleDict()
         for name, model in self.models_dict.items():
             for param in model.parameters():
                 param.requires_grad = False
             model.eval()
             
-            # Infer hidden dim from dummy pass
+            # Infer hidden dim
             dummy_batch = {
                 'x': torch.zeros(1, seq_len, n_features).to(device),
                 'observe_power': torch.zeros(1, seq_len, n_features).to(device)
             }
             with torch.no_grad():
                 h = model.forward_hidden(dummy_batch)
-                # Calculate flattened input dimension:
-                # If 4D (B, C, P, D), in_dim = P * D
-                # If 3D (B, C, D), in_dim = D
-                if h.dim() == 4:
-                    in_dim = h.shape[2] * h.shape[3]
-                else:
-                    in_dim = h.shape[-1]
-                self.projectors[name] = DeepFlattenMapper(in_dim, d_fusion, dropout=self.dropout_rate)
+                in_dim = h.shape[-1]
+                self.projectors[name] = CrossAttnMapper(
+                    in_dim, d_fusion, n_features, 
+                    queries_per_expert=queries_per_expert,
+                    use_dynamic_queries=use_dynamic_queries,
+                    dropout=self.dropout_rate
+                )
         
-        # --- Stage 2: Soft MoE (Fusing) ---
-        self.soft_moe = SoftMoELayer(d_fusion, num_experts=num_experts, slots_per_expert=4)
-        self.norm2 = nn.LayerNorm(d_fusion)
-        
-        # --- Stage 3: Prediction Head ---
-        # TabM-inspired Multi-head prediction for robust results
-        self.output_head = MultiHeadPredictor(d_fusion, pred_len, n_heads=4, dropout=self.dropout_rate)
+        self.num_queries = len(self.models_dict) * queries_per_expert
 
-        # Aggregation layer: Map num_queries back to actual n_features
+        # Fusion and Prediction
+        self.soft_moe = SoftMoELayer(d_fusion, num_experts=num_experts, slots_per_expert=4)
+        self.norm = nn.LayerNorm(d_fusion)
+        self.output_head = MultiHeadPredictor(d_fusion, pred_len, n_heads=4, dropout=self.dropout_rate)
         self.aggregate = nn.Conv1d(self.num_queries, self.n_features, 1)
         
         self.to(device)
 
-    def _init_queries(self, init_type):
-        """
-        Experimental initialization strategies for static queries.
-        """
-        import math
-        if self.queries is None: return
-        q = self.queries.data
-        d_fusion = q.size(-1)
-
-        if init_type == 'normal':
-            nn.init.normal_(q, std=0.02)
-        elif init_type == 'orthogonal':
-            flat_q = torch.empty(self.num_queries, d_fusion)
-            nn.init.orthogonal_(flat_q)
-            q.copy_(flat_q.unsqueeze(0))
-        elif init_type == 'fourier':
-            for i in range(self.num_queries):
-                for j in range(d_fusion // 2):
-                    val = i / math.pow(10000, 2 * j / d_fusion)
-                    q[0, i, 2 * j] = math.sin(val)
-                    q[0, i, 2 * j + 1] = math.cos(val)
-            q.mul_(0.02)
-        elif init_type == 'kaiming':
-            nn.init.kaiming_normal_(q, mode='fan_in', nonlinearity='leaky_relu')
-        elif init_type == 'xavier':
-            flat_q = torch.empty(self.num_queries, d_fusion)
-            nn.init.xavier_normal_(flat_q)
-            q.copy_(flat_q.unsqueeze(0))
-        elif init_type == 'uniform':
-            limit = math.sqrt(3.0 / d_fusion)
-            nn.init.uniform_(q, -limit, limit)
-        elif init_type == 'constant':
-            nn.init.constant_(q, 1.0)
-            q.add_(torch.randn_like(q) * 0.001)
-        else:
-            raise ValueError(f"Unknown query_init_type: {init_type}")
-
     def forward(self, batch):
-        # 1. Extract embeddings using the RAW batch
+        x_raw = batch['x']
+        
+        # 1. Distill features from each expert
         all_tokens = []
         with torch.no_grad():
             for name, model in self.models_dict.items():
                 h = model.forward_hidden(batch) 
-                proj_h = self.projectors[name](h)
+                proj_h = self.projectors[name](h, x_raw=x_raw)
                 all_tokens.append(proj_h)
         
-        # Concatenate tokens from all experts: (B, Num_Models * C, d_fusion)
-        kv = torch.cat(all_tokens, dim=1)
-        B = kv.shape[0]
+        # 2. Concatenate balanced tokens: (B, Num_Models * K, d_fusion)
+        packed_tokens = torch.cat(all_tokens, dim=1)
         
-        # 2. Query Generation (Dynamic or Static)
-        if self.use_dynamic_queries:
-            q = self.query_gen(batch['x']) # (B, num_queries, d_fusion)
-        else:
-            q = self.queries.expand(B, -1, -1)
-            
-        # 3. TokenPacker: Aggregate info from all models into queries
-        attn_out, _ = self.cross_attn(q, kv, kv)
-        packed_tokens = self.norm1(q + attn_out) # (B, num_queries, d_fusion)
-        
-        # 4. Soft MoE: Fuse features in the latent space
+        # 3. Global Fusion
         fused_tokens = self.soft_moe(packed_tokens)
-        fused_tokens = self.norm2(packed_tokens + fused_tokens)
+        fused_tokens = self.norm(packed_tokens + fused_tokens)
         
-        # 5. TabM-style multi-head prediction: (n_heads, B, Q, P) or (B, Q, P)
+        # 4. Predict
         out = self.output_head(fused_tokens) 
         
-        # 6. Information Aggregation: Map queries to actual feature count
-        if out.dim() == 4: # Training mode: (n_heads, B, Q, P)
+        # 5. Aggregate back to feature dimension
+        if out.dim() == 4: # Training
             n_heads, B, Q, P = out.shape
-            # Flatten heads into batch dimension for aggregate layer: (n_heads*B, Q, P)
             out_flat = out.view(n_heads * B, Q, P)
-            output = self.aggregate(out_flat) # (n_heads*B, n_features, P)
-            # Reshape back: (n_heads, B, n_features, P)
+            output = self.aggregate(out_flat)
             output = output.view(n_heads, B, self.n_features, P)
-            # Final output formatting: (n_heads, B, P, n_features)
             return output.transpose(2, 3)
-        # Inference mode: (B, Q, P)
-        output = self.aggregate(out) # (B, n_features, P)
-        return output.transpose(1, 2) # (B, P, n_features)
+        
+        output = self.aggregate(out)
+        return output.transpose(1, 2)
 
 class FusionFeatureModel(nn.Module):
     """
-    Same architecture as FusionModel, but accepts pre-computed hidden states (tensors)
-    directly. This is used for fast iteration on the fusion architecture.
+    Feature-input version of the refactored FusionModel.
     """
     def __init__(self, expert_dims, pred_len, n_features, 
-                 num_queries=None, d_fusion=256, num_experts=4, device='cpu', 
-                 query_init_type='orthogonal', use_dynamic_queries=True,
-                 dropout=0.1):
+                 queries_per_expert=16, d_fusion=256, num_experts=4, device='cpu', 
+                 use_dynamic_queries=True, dropout=0.1):
         super().__init__()
         self.device = device
         self.pred_len = pred_len
@@ -312,120 +252,46 @@ class FusionFeatureModel(nn.Module):
         self.use_dynamic_queries = use_dynamic_queries
         self.dropout_rate = dropout
         self.expert_names = list(expert_dims.keys())
+        self.queries_per_expert = queries_per_expert
 
-        # Use n_features as default num_queries for channel-specific fusion
-        self.num_queries = num_queries if num_queries is not None else n_features
-
-        # --- Stage 1: TokenPacker (Injection) ---
-        if self.use_dynamic_queries:
-            self.query_gen = QueryGenerator(n_features, self.num_queries, d_fusion)
-            self.queries = None
-        else:
-            self.queries = nn.Parameter(torch.empty(1, self.num_queries, d_fusion))
-            self._init_queries(query_init_type)
-
-        self.cross_attn = nn.MultiheadAttention(d_fusion, num_heads=8, batch_first=True)
-        self.norm1 = nn.LayerNorm(d_fusion)
-        
-        # Individual projectors to align base model outputs (B, C, D_i) -> (B, C, d_fusion)
         self.projectors = nn.ModuleDict()
         for name, in_dim in expert_dims.items():
-            self.projectors[name] = DeepFlattenMapper(in_dim, d_fusion, dropout=self.dropout_rate)
+            self.projectors[name] = CrossAttnMapper(
+                in_dim, d_fusion, n_features,
+                queries_per_expert=queries_per_expert,
+                use_dynamic_queries=use_dynamic_queries,
+                dropout=self.dropout_rate
+            )
         
-        # --- Stage 2: Soft MoE (Fusing) ---
+        self.num_queries = len(expert_dims) * queries_per_expert
         self.soft_moe = SoftMoELayer(d_fusion, num_experts=num_experts, slots_per_expert=4)
-        self.norm2 = nn.LayerNorm(d_fusion)
-        
-        # --- Stage 3: Prediction Head ---
+        self.norm = nn.LayerNorm(d_fusion)
         self.output_head = MultiHeadPredictor(d_fusion, pred_len, n_heads=4, dropout=self.dropout_rate)
-
-        # Aggregation layer: Map num_queries back to actual n_features
         self.aggregate = nn.Conv1d(self.num_queries, self.n_features, 1)
         
         self.to(device)
 
-    def _init_queries(self, init_type):
-        """
-        Copied from FusionModel for consistency.
-        """
-        import math
-        if self.queries is None: return
-        q = self.queries.data
-        d_fusion = q.size(-1)
-
-        if init_type == 'normal':
-            nn.init.normal_(q, std=0.02)
-        elif init_type == 'orthogonal':
-            flat_q = torch.empty(self.num_queries, d_fusion)
-            nn.init.orthogonal_(flat_q)
-            q.copy_(flat_q.unsqueeze(0))
-        elif init_type == 'fourier':
-            for i in range(self.num_queries):
-                for j in range(d_fusion // 2):
-                    val = i / math.pow(10000, 2 * j / d_fusion)
-                    q[0, i, 2 * j] = math.sin(val)
-                    q[0, i, 2 * j + 1] = math.cos(val)
-            q.mul_(0.02)
-        elif init_type == 'kaiming':
-            nn.init.kaiming_normal_(q, mode='fan_in', nonlinearity='leaky_relu')
-        elif init_type == 'xavier':
-            flat_q = torch.empty(self.num_queries, d_fusion)
-            nn.init.xavier_normal_(flat_q)
-            q.copy_(flat_q.unsqueeze(0))
-        elif init_type == 'uniform':
-            limit = math.sqrt(3.0 / d_fusion)
-            nn.init.uniform_(q, -limit, limit)
-        elif init_type == 'constant':
-            nn.init.constant_(q, 1.0)
-            q.add_(torch.randn_like(q) * 0.001)
-        else:
-            raise ValueError(f"Unknown query_init_type: {init_type}")
-
     def forward(self, hidden_dict, x_input=None):
-        """
-        hidden_dict: {expert_name: (B, C, D) or (B, C, P, D)}
-        x_input: (B, L, C) original input for dynamic query generation
-        """
-        # 1. Align and project base model outputs
+        # 1. Distill
         all_tokens = []
         for name in self.expert_names:
             h = hidden_dict[name]
-            proj_h = self.projectors[name](h)
+            proj_h = self.projectors[name](h, x_raw=x_input)
             all_tokens.append(proj_h)
         
-        # Concatenate tokens from all experts: (B, Num_Models * C, d_fusion)
-        kv = torch.cat(all_tokens, dim=1)
-        B = kv.shape[0]
-        
-        # 2. Query Generation (Dynamic or Static)
-        if self.use_dynamic_queries:
-            if x_input is None:
-                raise ValueError("Dynamic queries require x_input (original feature data).")
-            q = self.query_gen(x_input) # (B, num_queries, d_fusion)
-        else:
-            q = self.queries.expand(B, -1, -1)
-            
-        # 3. TokenPacker: Aggregate info from all models into queries
-        attn_out, _ = self.cross_attn(q, kv, kv)
-        packed_tokens = self.norm1(q + attn_out) # (B, num_queries, d_fusion)
-        
-        # 4. Soft MoE: Fuse features in the latent space
+        # 2. Concat and Fuse
+        packed_tokens = torch.cat(all_tokens, dim=1)
         fused_tokens = self.soft_moe(packed_tokens)
-        fused_tokens = self.norm2(packed_tokens + fused_tokens)
+        fused_tokens = self.norm(packed_tokens + fused_tokens)
         
-        # 5. TabM-style multi-head prediction: (n_heads, B, Q, P) or (B, Q, P)
+        # 3. Predict and Aggregate
         out = self.output_head(fused_tokens) 
-        
-        # 6. Information Aggregation: Map queries to actual feature count
-        if out.dim() == 4: # Training mode: (n_heads, B, Q, P)
+        if out.dim() == 4:
             n_heads, B, Q, P = out.shape
-            # Flatten heads into batch dimension for aggregate layer: (n_heads*B, Q, P)
             out_flat = out.view(n_heads * B, Q, P)
-            output = self.aggregate(out_flat) # (n_heads*B, n_features, P)
-            # Reshape back: (n_heads, B, n_features, P)
+            output = self.aggregate(out_flat)
             output = output.view(n_heads, B, self.n_features, P)
-            # Final output formatting: (n_heads, B, P, n_features)
             return output.transpose(2, 3)
-        else: # Inference mode: (B, Q, P)
-            output = self.aggregate(out) # (B, n_features, P)
-            return output.transpose(1, 2) # (B, P, n_features)
+        else:
+            output = self.aggregate(out)
+            return output.transpose(1, 2)

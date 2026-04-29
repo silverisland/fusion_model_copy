@@ -60,7 +60,7 @@ def extract_and_save_features(model, dataloader, save_path, device='cpu'):
     # 2. Create a memory-mapped array (pre-allocates disk space)
     # Final shape: (Num_Samples, *Feature_Shape)
     full_shape = (num_samples, *feature_shape)
-    fp = np.memmap(save_path, dtype='float32', mode='w+', shape=full_shape)
+    fp = np.lib.format.open_memmap(save_path, dtype='float32', mode='w+', shape=full_shape)
     
     print(f"Allocated memmap at {save_path} with shape {full_shape}")
     
