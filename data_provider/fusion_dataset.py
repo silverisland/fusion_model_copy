@@ -1,17 +1,18 @@
 import pandas as pd
 import numpy as np
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader  
 
 class UnifiedDataset(Dataset):
     """
     Optimized Row-based dataset for fusion models. 
     Pre-converts DataFrame columns to NumPy arrays for fast indexing.
     """
-    def __init__(self, df, timestamp_cols=['date', 'time', 'timestamp', 'timestamp_win']):
+    def __init__(self, df, timestamp_cols=['timestamp_win']):
         # 1. Identify and separate timestamp columns
         self.timestamp_cols = [col for col in timestamp_cols if col in df.columns]
         self.feature_cols = [col for col in df.columns if col not in self.timestamp_cols]
+        self.timestamp = np.stack(df['timestamp_win'].values)
 
         # 2. Pre-process features into a dictionary of arrays
         self.data_dict = {}
@@ -26,10 +27,7 @@ class UnifiedDataset(Dataset):
         # 3. Also pre-process timestamp columns
         for col in self.timestamp_cols:
             vals = df[col].values
-            if len(vals) > 0 and isinstance(vals[0], np.ndarray):
-                self.data_dict[col] = np.stack(vals)
-            else:
-                self.data_dict[col] = vals
+            self.data_dict[col] = vals
 
         self.column_names = self.feature_cols
         self.length = len(df)
@@ -43,80 +41,6 @@ class UnifiedDataset(Dataset):
         sample['index'] = index
         return sample
 
-class FusionFeatureDataset(Dataset):
-    """
-    Dataset for fast fusion model iteration using pre-computed expert hidden states.
-    Uses memory-mapping (mmap_mode='r') to avoid loading all features into RAM.
-    """
-    def __init__(self, df, feature_paths, target_cols):
-        self.df = df
-        self.target_cols = target_cols
-        self.feature_paths = feature_paths
-        
-        # Open memory-mapped files
-        self.experts_data = {
-            name: np.load(path, mmap_mode='r') 
-            for name, path in feature_paths.items()
-        }
-        
-        # Verify alignment
-        for name, data in self.experts_data.items():
-            if len(data) != len(df):
-                raise ValueError(f"Expert feature '{name}' has {len(data)} samples, but DataFrame has {len(df)} samples.")
-
-    def __len__(self):
-        return len(self.df)
-
-    def __getitem__(self, index):
-        # 1. Load expert features for this index
-        # Returns dict: {'expert_a': torch.Tensor(L, D1), ...}
-        feats = {
-            name: torch.from_numpy(data[index].copy()).float()
-            for name, data in self.experts_data.items()
-        }
-        
-        # 2. Load target columns from DataFrame
-        targets = {}
-        for col in self.target_cols:
-            val = self.df.iloc[index][col]
-            if isinstance(val, np.ndarray):
-                targets[col] = torch.from_numpy(val).float()
-            else:
-                targets[col] = torch.tensor(val).float()
-        
-        # 3. Load additional input 'x' if present in df (for query generation)
-        input_x = None
-        if 'observe_power' in self.df.columns:
-             input_x = torch.from_numpy(self.df.iloc[index]['observe_power']).float()
-        
-        return feats, targets, input_x
-
-def fusion_collate_fn(batch):
-    """
-    Collate function for FusionFeatureDataset.
-    Returns (collated_feats, collated_targets, collated_x)
-    """
-    expert_names = batch[0][0].keys()
-    target_names = batch[0][1].keys()
-    
-    collated_feats = {
-        name: torch.stack([sample[0][name] for sample in batch])
-        for name in expert_names
-    }
-    
-    collated_targets = {
-        name: torch.stack([sample[1][name] for sample in batch])
-        for name in target_names
-    }
-    
-    collated_x = None
-    if batch[0][2] is not None:
-        collated_x = torch.stack([sample[2] for sample in batch])
-        if collated_x.dim() == 2:
-            collated_x = collated_x.unsqueeze(-1)
-            
-    return collated_feats, collated_targets, collated_x
-
 def collate_fn(batch):
     """
     Optimized collate function.
@@ -128,9 +52,41 @@ def collate_fn(batch):
     for key in feature_keys:
         # Using np.array for speed if not already numpy
         data_list = [b[key] for b in batch]
-        collated[key] = torch.from_numpy(np.stack(data_list)).float()
+        first_elem = data_list[0] 
+        if isinstance(first_elem, (str, np.str_, np.datetime64)):
+            collated[key] = [pd.Timestamp(dt).to_pydatetime() for dt in data_list]
+        else:
+            collated[key] = torch.from_numpy(np.stack(data_list)).float()
 
     collated['index'] = torch.tensor([b['index'] for b in batch])
     collated['column_names'] = feature_keys
 
     return collated
+
+def data_provider(args, data_df, flag):
+    if flag == 'train':
+        shuffle_flag = True 
+        drop_last = False 
+        batch_size = args.batch_size 
+    elif flag == 'val':
+        shuffle_flag = False 
+        drop_last = True 
+        batch_size = args.batch_size
+    else:
+        shuffle_flag = False # Test usually doesn't need shuffle
+        drop_last = True 
+        batch_size = args.batch_size 
+    
+    data_set = UnifiedDataset(
+        df = data_df,  
+    )
+
+    data_loader = DataLoader(
+        data_set, 
+        batch_size = batch_size, 
+        shuffle = shuffle_flag, 
+        collate_fn = collate_fn, 
+        drop_last = drop_last, 
+    )
+
+    return data_set, data_loader 

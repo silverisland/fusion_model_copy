@@ -1,6 +1,7 @@
 import argparse
 import os
 import torch
+import pandas as pd
 from exp.exp_main import Exp_Main
 import random
 import numpy as np
@@ -89,10 +90,19 @@ def main():
 
     Exp = Exp_Main
 
+    train_df = pd.read_parquet('xxx')
+    valid_df = pd.read_parquet('xxx')
+    test_df = pd.read_parquet('xxx')
+
+    for col in ['observe_power', 'observe_power_future', 'chronos']:
+        train_df[col] /= 500 
+        valid_df[col] /= 500 
+        test_df[col] /= 500 
+
     if args.is_training:
         for ii in range(args.itr):
             # setting record of experiments
-            setting = '{}_{}_{}_ft{}_sl{}_ll{}_pl{}_dm{}_nh{}_el{}_dl{}_df{}_fc{}_eb{}_dt{}_{}_{}'.format(
+            setting = '{}_{}_{}_ft{}_sl{}_ll{}_pl{}_dm{}_nh{}_el{}_dl{}_df{}_fc{}_eb{}_dt{}_{}'.format(
                 args.model_id,
                 args.model,
                 args.data,
@@ -108,23 +118,18 @@ def main():
                 args.factor,
                 args.embed,
                 args.distil,
-                args.des, ii)
+                args.des)
 
             exp = Exp(args)  # set experiments
             print('>>>>>>>start training : {}>>>>>>>>>>>>>>>>>>>>>>>>>>'.format(setting))
-            exp.train(setting)
+            exp.train(setting, train_df, valid_df)
 
             print('>>>>>>>testing : {}<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<'.format(setting))
-            exp.test(setting)
-
-            if args.do_predict:
-                print('>>>>>>>predicting : {}<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<'.format(setting))
-                exp.predict(setting, True)
+            exp.test(setting, test_df)
 
             torch.cuda.empty_cache()
     else:
-        ii = 0
-        setting = '{}_{}_{}_ft{}_sl{}_ll{}_pl{}_dm{}_nh{}_el{}_dl{}_df{}_fc{}_eb{}_dt{}_{}_{}'.format(
+        setting = '{}_{}_{}_ft{}_sl{}_ll{}_pl{}_dm{}_nh{}_el{}_dl{}_df{}_fc{}_eb{}_dt{}_{}'.format(
             args.model_id,
             args.model,
             args.data,
@@ -140,11 +145,11 @@ def main():
             args.factor,
             args.embed,
             args.distil,
-            args.des, ii)
+            args.des)
 
         exp = Exp(args)  # set experiments
         print('>>>>>>>testing : {}<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<'.format(setting))
-        exp.test(setting, test=1)
+        exp.test(setting, test_df, test=1)
         torch.cuda.empty_cache()
 
 

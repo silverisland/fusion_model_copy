@@ -1,15 +1,17 @@
-from data_provider.data_factory import data_provider
+from data_provider.fusion_dataset import data_provider
 from exp.exp_basic import Exp_Basic
-from models import DLinear, PatchTST, iTransformer, TimesNet, FusionModel
-from utils.tools import EarlyStopping, adjust_learning_rate, visual
+from models import FusionModel, DLinear, PatchTST, iTransformer, TimesNet
+from utils.tools import EarlyStopping, adjust_learning_rate
 from utils.metrics import metric
 
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 from torch import optim
 import os
 import time
+import yaml
 import warnings
 
 warnings.filterwarnings('ignore')
@@ -20,26 +22,34 @@ class Exp_Main(Exp_Basic):
 
     def _build_model(self):
         model_dict = {
-            'DLinear': DLinear,
-            'PatchTST': PatchTST,
-            'iTransformer': iTransformer,
-            'TimesNet': TimesNet,
+            'M1': DLinear,
+            'M2': PatchTST,
+            'M3': iTransformer,
+            'M4': TimesNet,
         }
         
         if self.args.model == 'FusionModel':
             # Load base models
             base_models = {}
-            model_names = ['DLinear', 'PatchTST', 'iTransformer', 'TimesNet']
-            for name in model_names:
-                m = model_dict[name](self.args.seq_len, self.args.pred_len).to(self.device)
-                path = f'checkpoints/{name}.pth'
-                if os.path.exists(path):
-                    m.load_state_dict(torch.load(path, map_location=self.device))
-                    print(f"Loaded weights for {name}")
-                else:
-                    print(f"Warning: {path} not found for FusionModel. Using randomly initialized weights.")
-                base_models[name] = m
+
+            with open('./configs/m1config.yaml', 'r', encoding = 'utf-8') as f:
+                config1 = yaml.safe_load(f)
+            with open('./configs/m2config.yaml', 'r', encoding = 'utf-8') as f:
+                config2 = yaml.safe_load(f)
+            with open('./configs/m3config.yaml', 'r', encoding = 'utf-8') as f:
+                config3 = yaml.safe_load(f)
+            with open('./configs/m4config.yaml', 'r', encoding = 'utf-8') as f:
+                config4 = yaml.safe_load(f)
             
+            if 'M1' in model_dict.keys():
+                base_models['m1'] = model_dict['M1'](config1)
+            if 'M2' in model_dict.keys():
+                base_models['m2'] = model_dict['M2'](config2) 
+            if 'M3' in model_dict.keys():
+                base_models['m3'] = model_dict['M3'](config3)
+            if 'M4' in model_dict.keys():
+                base_models['m4'] = model_dict['M4'](config4)
+
             model = FusionModel(base_models, self.args.seq_len, self.args.pred_len, self.args.enc_in, device=self.device).float()
         else:
             model = model_dict[self.args.model](self.args.seq_len, self.args.pred_len).float()
@@ -48,14 +58,17 @@ class Exp_Main(Exp_Basic):
             model = nn.DataParallel(model, device_ids=self.args.device_ids)
         return model
 
-    def _get_data(self, flag):
-        data_set, data_loader = data_provider(self.args, flag)
+    def _get_data(self, flag, df):
+        data_set, data_loader = data_provider(self.args, df, flag)
         return data_set, data_loader
 
     def _select_optimizer(self):
         if self.args.model == 'FusionModel':
             # Optimize all trainable parameters (fusion layers)
-            model_optim = optim.Adam(filter(lambda p: p.requires_grad, self.model.parameters()), lr=self.args.learning_rate)
+            model_optim = optim.Adam(
+                filter(lambda p: p.requires_grad, self.model.parameters()), 
+                lr=self.args.learning_rate
+                )
         else:
             model_optim = optim.Adam(self.model.parameters(), lr=self.args.learning_rate)
         return model_optim
@@ -68,19 +81,14 @@ class Exp_Main(Exp_Basic):
         mse = nn.MSELoss()
         
         def composite_loss(pred, target):
-            # TabM adaptation: if pred is (n_heads, B, P, C), expand target to match
-            if pred.dim() == 4:
-                # (B, P, C) -> (n_heads, B, P, C)
-                target = target.unsqueeze(0).expand(pred.size(0), -1, -1, -1)
-
             # 1. Base robust regression loss
             loss_val = huber(pred, target)
             
             # 2. Trend (Ramp) loss: focuses on the shape/change rate
             # Handles (B, P, C) or (n_heads, B, P, C)
-            if pred.shape[-2] > 1:
-                diff_pred = pred[..., 1:, :] - pred[..., :-1, :]
-                diff_target = target[..., 1:, :] - target[..., :-1, :]
+            if pred.shape[1] > 1:
+                diff_pred = pred[:, 1:] - pred[:, :-1]
+                diff_target = target[:, 1:] - target[:, :-1]
                 loss_trend = mse(diff_pred, diff_target)
                 return loss_val + 0.5 * loss_trend # lambda=0.5
             
@@ -102,10 +110,9 @@ class Exp_Main(Exp_Basic):
         self.model.train()
         return total_loss
 
-    def train(self, setting):
-        train_data, train_loader = self._get_data(flag='train')
-        vali_data, vali_loader = self._get_data(flag='val')
-        test_data, test_loader = self._get_data(flag='test')
+    def train(self, setting, train_df, valid_df):
+        train_data, train_loader = self._get_data(flag='train', df = train_df)
+        vali_data, vali_loader = self._get_data(flag='val', df = valid_df)
 
         path = os.path.join(self.args.checkpoints, setting)
         if not os.path.exists(path):
@@ -130,10 +137,7 @@ class Exp_Main(Exp_Basic):
                 model_optim.zero_grad()
                 batch = {k: (v.to(self.device) if torch.is_tensor(v) else v) for k, v in batch.items()}
 
-                if self.args.model == 'FusionModel':
-                    outputs = self.model(batch)
-                else:
-                    outputs = self.model(batch)
+                outputs = self.model(batch)
 
                 loss = criterion(outputs, batch['observe_power_future'])
                 train_loss.append(loss.item())
@@ -152,10 +156,9 @@ class Exp_Main(Exp_Basic):
             print("Epoch: {} cost time: {}".format(epoch + 1, time.time() - epoch_time))
             train_loss = np.average(train_loss)
             vali_loss = self.vali(vali_data, vali_loader, criterion)
-            test_loss = self.vali(test_data, test_loader, criterion)
 
-            print("Epoch: {0}, Steps: {1} | Train Loss: {2:.7f} Vali Loss: {3:.7f} Test Loss: {4:.7f}".format(
-                epoch + 1, train_steps, train_loss, vali_loss, test_loss))
+            print("Epoch: {0}, Steps: {1} | Train Loss: {2:.7f} Vali Loss: {3:.7f} ".format(
+                epoch + 1, train_steps, train_loss, vali_loss))
             early_stopping(vali_loss, self.model, path)
             if early_stopping.early_stop:
                 print("Early stopping")
@@ -168,8 +171,8 @@ class Exp_Main(Exp_Basic):
 
         return self.model
 
-    def test(self, setting, test=0):
-        test_data, test_loader = self._get_data(flag='test')
+    def test(self, setting, test_df, test=0):
+        test_data, test_loader = self._get_data(flag='test', df = test_df)
         if test:
             print('loading model')
             self.model.load_state_dict(torch.load(os.path.join('./checkpoints/' + setting, 'checkpoint.pth')))
@@ -191,35 +194,17 @@ class Exp_Main(Exp_Basic):
 
                 preds.append(pred)
                 trues.append(true)
-                if i % 20 == 0:
-                    input = batch['x'].detach().cpu().numpy()
-                    gt = np.concatenate((input[0, :, -1], true[0, :, -1]), axis=0)
-                    pd = np.concatenate((input[0, :, -1], pred[0, :, -1]), axis=0)
-                    visual(gt, pd, os.path.join(folder_path, str(i) + '.pdf'))
 
-        preds = np.array(preds)
-        trues = np.array(trues)
-        print('test shape:', preds.shape, trues.shape)
-        preds = preds.reshape(-1, preds.shape[-2], preds.shape[-1])
-        trues = trues.reshape(-1, trues.shape[-2], trues.shape[-1])
-        print('test shape:', preds.shape, trues.shape)
-
-        # result save
-        folder_path = './results/' + setting + '/'
-        if not os.path.exists(folder_path):
-            os.makedirs(folder_path)
+        preds = np.concatenate(preds, axis=0)
+        trues = np.concatenate(trues, axis=0)
 
         mae, mse, rmse, mape, mspe = metric(preds, trues)
-        print('mse:{}, mae:{}'.format(mse, mae))
-        f = open("result.txt", 'a')
-        f.write(setting + "  \n")
-        f.write('mse:{}, mae:{}'.format(mse, mae))
-        f.write('\n')
-        f.write('\n')
-        f.close()
+        print('mae:{}, mse:{}, rmse:{}'.format(mae, mse, rmse))
 
-        np.save(folder_path + 'metrics.npy', np.array([mae, mse, rmse, mape, mspe]))
-        np.save(folder_path + 'pred.npy', preds)
-        np.save(folder_path + 'true.npy', trues)
+        result_df = pd.DataFrame([])
+        result_df['timestamp_win'] = test_data.timestamp 
+        result_df['observe_power_predict'] = [x for x in preds]
+        result_df['observe_power_future'] = [x for x in trues]
+        result_df.to_parquet('result_df.parquet', index = False)
 
         return
