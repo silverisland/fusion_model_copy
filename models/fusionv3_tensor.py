@@ -94,8 +94,11 @@ class FusionModelV3(nn.Module):
         B = batch['observe_power'].shape[0]
         
         # 0. Calculate statistics for Inverse RevIN
-        # observe_power: (B, L, C)
+        # observe_power: (B, L) or (B, L, C)
         x_raw = batch['observe_power']
+        if x_raw.dim() == 2:
+            x_raw = x_raw.unsqueeze(-1)
+            
         # mean/std: (B, C, 1) for broadcasting over (B, C, pred_len)
         mean = x_raw.mean(dim=1, keepdim=True).transpose(1, 2)
         std = torch.sqrt(x_raw.var(dim=1, keepdim=True, unbiased=False) + 1e-5).transpose(1, 2)
