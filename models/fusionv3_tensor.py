@@ -46,10 +46,10 @@ class FastSoftMoE(nn.Module):
 
 class FusionModelV3(nn.Module):
     """
-    FusionModel V3 Tensor version (Dedicated Query & Inverse RevIN):
+    FusionModel V3 Tensor version (Plan A: Normalized Training, Inverse De-norm Output):
     - Each expert model has its own dedicated set of learnable query parameters.
-    - Expert features are distilled into summary tokens using these private queries.
-    - Inverse RevIN is applied to the final output based on input statistics.
+    - Loss is calculated in the normalized space for numerical stability.
+    - Output is de-normalized for inference and metrics.
     """
     def __init__(self, models_dict, seq_len, pred_len, n_features, 
                  queries_per_expert=8, d_fusion=512, num_experts=6, device='cuda'):
@@ -93,51 +93,53 @@ class FusionModelV3(nn.Module):
     def forward(self, batch_tensor, batch, flag='test'):
         B = batch['observe_power'].shape[0]
         
-        # 0. Calculate statistics for Inverse RevIN
-        # observe_power: (B, L) or (B, L, C)
+        # 0. Calculate statistics for RevIN normalization/de-normalization
         x_raw = batch['observe_power']
         if x_raw.dim() == 2:
             x_raw = x_raw.unsqueeze(-1)
-            
-        # mean/std: (B, C, 1) for broadcasting over (B, C, pred_len)
+        # mean/std: (B, C, 1)
         mean = x_raw.mean(dim=1, keepdim=True).transpose(1, 2)
         std = torch.sqrt(x_raw.var(dim=1, keepdim=True, unbiased=False) + 1e-5).transpose(1, 2)
 
-        # 1. Distill features using per-expert dedicated queries
+        # 1. Distill features using per-expert dedicated queries (in normalized space)
         all_expert_summaries = []
         for name in self.expert_names:
             h = batch_tensor[name]
-            # Handle structured expert features
             if name == 'm2' and h.dim() == 4: h = h.flatten(1, 2)
             elif h.dim() == 2: h = h.unsqueeze(1)
             
             h_proj = self.projectors[name](h)
-            
-            # Use dedicated learnable queries for the current expert
             q = self.expert_queries[name].expand(B, -1, -1)
             summary, _ = self.expert_attns[name](q, h_proj, h_proj)
             all_expert_summaries.append(summary)
 
-        # 2. Concatenate all summaries from all experts
+        # 2. Global Interaction with SoftMoE
         combined_tokens = torch.cat(all_expert_summaries, dim=1) # (B, E*Q, D)
-        
-        # 3. Global Interaction with SoftMoE
         fused_tokens = self.soft_moe(combined_tokens)
         fused_tokens = self.norm(combined_tokens + fused_tokens)
         
-        # 4. Prediction (in normalized space)
-        out = self.output_head(fused_tokens) # (B, E*Q, pred_len)
-        output = self.aggregate(out) # (B, n_features, pred_len)
+        # 3. Prediction in Normalized Space
+        output_norm = self.aggregate(self.output_head(fused_tokens)) # (B, n_features, pred_len)
 
-        # 5. Inverse RevIN (De-normalization)
-        output = output * std + mean
+        # 4. De-normalize for final output
+        output_final = output_norm * std + mean
 
         if flag == 'test':
-            return output
+            return output_final
         else:
-            return output, self.loss_func(output, batch['target_power'])
+            # 5. Normalize target_power to match the model's output_norm for loss calculation
+            target_raw = batch['target_power']
+            if target_raw.dim() == 2:
+                target_raw = target_raw.unsqueeze(1)
+            target_norm = (target_raw - mean) / std
+            
+            loss = self.loss_func(output_norm, target_norm)
+            return output_final, loss
 
     def loss_func(self, pred, target):
+        """
+        Loss calculation in normalized space for better gradient stability.
+        """
         huber = nn.HuberLoss(delta=1.0)
         mse = nn.MSELoss()
         loss_val = huber(pred, target)
