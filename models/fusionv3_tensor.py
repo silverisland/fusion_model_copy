@@ -2,37 +2,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class QueryGenerator(nn.Module):
+class FastSoftMoE(nn.Module):
     """
-    Dynamically generates queries based on input data statistics (Mean, Std, Max, Min).
-    """
-    def __init__(self, n_features, num_queries, d_fusion):
-        super().__init__()
-        self.num_queries = num_queries
-        self.d_fusion = d_fusion
-        input_dim = n_features * 4
-        
-        self.generator = nn.Sequential(
-            nn.Linear(input_dim, d_fusion),
-            nn.GELU(),
-            nn.Linear(d_fusion, num_queries * d_fusion),
-            nn.LayerNorm(num_queries * d_fusion)
-        )
-        
-    def forward(self, x):
-        B, L, C = x.shape
-        mean = x.mean(dim=1)
-        std = x.std(dim=1)
-        max_val, _ = x.max(dim=1)
-        min_val, _ = x.min(dim=1)
-        stats = torch.cat([mean, std, max_val, min_val], dim=-1)
-        queries = self.generator(stats)
-        return queries.view(B, self.num_queries, self.d_fusion)
-
-class SoftMoELayer(nn.Module):
-    """
-    Soft MoE implementation for feature-level fusion.
-    Optimized for (Batch, Channel, Dim) token structure.
+    Fully vectorized Soft MoE implementation using einsum.
+    Eliminates Python loops for fast expert processing.
     """
     def __init__(self, d_model, num_experts, slots_per_expert):
         super().__init__()
@@ -43,115 +16,118 @@ class SoftMoELayer(nn.Module):
         
         self.phi = nn.Parameter(torch.randn(d_model, self.num_slots) * 0.02)
         
-        self.experts = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(d_model, d_model * 2),
-                nn.GELU(),
-                nn.Linear(d_model * 2, d_model),
-                nn.Dropout(0.1)
-            ) for _ in range(num_experts)
-        ])
+        # Vectorized expert weights: (Expert, In, Out)
+        self.w1 = nn.Parameter(torch.randn(num_experts, d_model, d_model * 2) * 0.02)
+        self.w2 = nn.Parameter(torch.randn(num_experts, d_model * 2, d_model) * 0.02)
+        self.b1 = nn.Parameter(torch.zeros(num_experts, 1, d_model * 2))
+        self.b2 = nn.Parameter(torch.zeros(num_experts, 1, d_model))
         
     def forward(self, x):
         B, N, D = x.shape
-        logits = torch.matmul(x, self.phi) 
+        
+        # Compute routing logits
+        logits = torch.matmul(x, self.phi) # (B, N, S)
         dispatch_weights = F.softmax(logits, dim=1) 
         combine_weights = F.softmax(logits, dim=2) 
         
-        slots_input = torch.matmul(dispatch_weights.transpose(1, 2), x) 
+        # 1. Dispatch tokens to slots
+        slots_input = torch.matmul(dispatch_weights.transpose(1, 2), x) # (B, S, D)
+        slots_input = slots_input.view(B, self.num_experts, self.slots_per_expert, D)
         
-        slots_output = []
-        for i in range(self.num_experts):
-            start = i * self.slots_per_expert
-            end = (i + 1) * self.slots_per_expert
-            expert_in = slots_input[:, start:end, :]
-            expert_out = self.experts[i](expert_in)
-            slots_output.append(expert_out)
+        # 2. Parallel processing by experts (Einsum)
+        h = torch.einsum('besd,edh->besh', slots_input, self.w1) + self.b1
+        h = F.gelu(h)
+        slots_output = torch.einsum('besh,ehd->besd', h, self.w2) + self.b2
         
-        slots_output = torch.cat(slots_output, dim=1) 
+        # 3. Combine slots back
+        slots_output = slots_output.reshape(B, self.num_slots, D)
         out = torch.matmul(combine_weights, slots_output) 
         return out
 
 class FusionModelV3(nn.Module):
     """
-    FusionModel V3 Tensor version (High Precision Edition):
-    - Uses pre-computed expert hidden states from batch_tensor.
-    - Integrates QueryGenerator for dynamic feature extraction.
-    - Uses enhanced projectors (Linear-GELU-Linear + LayerNorm).
-    - Includes Huber + Trend Loss for better generalization.
+    FusionModel V3 Tensor version (Dedicated Query & Inverse RevIN):
+    - Each expert model has its own dedicated set of learnable query parameters.
+    - Expert features are distilled into summary tokens using these private queries.
+    - Inverse RevIN is applied to the final output based on input statistics.
     """
     def __init__(self, models_dict, seq_len, pred_len, n_features, 
-                 num_queries=16, d_fusion=512, num_experts=6, device='cuda'):
+                 queries_per_expert=8, d_fusion=512, num_experts=6, device='cuda'):
         super().__init__()
         self.device = device
         self.pred_len = pred_len
         self.n_features = n_features
         self.d_fusion = d_fusion
-        self.num_queries = num_queries
+        self.queries_per_expert = queries_per_expert
         self.expert_names = list(models_dict.keys())
+        num_exp = len(self.expert_names)
 
-        # 1. Dynamic Query Generation
-        self.query_gen = QueryGenerator(n_features, num_queries, d_fusion)
+        # 1. Dedicated Learnable Queries for each expert
+        self.expert_queries = nn.ParameterDict({
+            name: nn.Parameter(torch.randn(1, queries_per_expert, d_fusion) * 0.02)
+            for name in self.expert_names
+        })
 
-        # 2. Enhanced Projectors and Per-Expert Attention
+        # 2. Projectors and Independent Attention Heads
         self.projectors = nn.ModuleDict()
-        self.proj_norms = nn.ModuleDict()
         self.expert_attns = nn.ModuleDict()
-
         for name in self.expert_names:
-            # Dimension mapping based on known expert outputs
-            if name == 'm1': in_dim = 512
-            elif name == 'm2': in_dim = 1024
-            elif name == 'm3': in_dim = 62208
-            elif name == 'm4': in_dim = 11520
-            else: in_dim = d_fusion
-
-            self.projectors[name] = nn.Sequential(
-                nn.Linear(in_dim, d_fusion),
-                nn.GELU(),
-                nn.Linear(d_fusion, d_fusion)
-            )
-            self.proj_norms[name] = nn.LayerNorm(d_fusion)
+            d_in = {'m1': 512, 'm2': 256, 'm3': 384, 'm4': 512}.get(name, d_fusion)
+            self.projectors[name] = nn.Linear(d_in, d_fusion)
             self.expert_attns[name] = nn.MultiheadAttention(d_fusion, num_heads=8, batch_first=True)
 
-        # 3. Global Fusion components
-        self.soft_moe = SoftMoELayer(d_fusion, num_experts=num_experts, slots_per_expert=4)
+        # 3. Global Fusion via Vectorized SoftMoE
+        self.soft_moe = FastSoftMoE(d_fusion, num_experts=num_experts, slots_per_expert=4)
         self.norm = nn.LayerNorm(d_fusion)
         
-        # 4. Output head logic from fusion.py
+        # 4. Output head
         self.output_head = nn.Linear(d_fusion, pred_len)
-        self.total_tokens = num_queries * len(self.expert_names)
+        self.total_tokens = queries_per_expert * num_exp
         self.aggregate = nn.Conv1d(self.total_tokens, self.n_features, 1)
         
+        # Balanced Initialization
+        nn.init.normal_(self.output_head.weight, std=0.01)
+        nn.init.zeros_(self.output_head.bias)
         self.to(device)
 
     def forward(self, batch_tensor, batch, flag='test'):
         B = batch['observe_power'].shape[0]
         
-        # 1. Generate dynamic queries
-        q_gen = self.query_gen(batch['observe_power'].unsqueeze(-1)) # (B, Q, D)
+        # 0. Calculate statistics for Inverse RevIN
+        # observe_power: (B, L, C)
+        x_raw = batch['observe_power']
+        # mean/std: (B, C, 1) for broadcasting over (B, C, pred_len)
+        mean = x_raw.mean(dim=1, keepdim=True).transpose(1, 2)
+        std = torch.sqrt(x_raw.var(dim=1, keepdim=True, unbiased=False) + 1e-5).transpose(1, 2)
 
-        # 2. Distill features from each expert
+        # 1. Distill features using per-expert dedicated queries
         all_expert_summaries = []
         for name in self.expert_names:
-            h = batch_tensor[name].flatten(1).unsqueeze(1) # (B, 1, D_in)
+            h = batch_tensor[name]
+            # Handle structured expert features
+            if name == 'm2' and h.dim() == 4: h = h.flatten(1, 2)
+            elif h.dim() == 2: h = h.unsqueeze(1)
             
-            # Project and Normalize
             h_proj = self.projectors[name](h)
-            h_proj = self.proj_norms[name](h_proj)
             
-            # Use dynamic queries to extract info from this expert
-            summary, _ = self.expert_attns[name](q_gen, h_proj, h_proj) # (B, Q, D)
+            # Use dedicated learnable queries for the current expert
+            q = self.expert_queries[name].expand(B, -1, -1)
+            summary, _ = self.expert_attns[name](q, h_proj, h_proj)
             all_expert_summaries.append(summary)
 
+        # 2. Concatenate all summaries from all experts
+        combined_tokens = torch.cat(all_expert_summaries, dim=1) # (B, E*Q, D)
+        
         # 3. Global Interaction with SoftMoE
-        combined_tokens = torch.cat(all_expert_summaries, dim=1) # (B, total_tokens, D)
         fused_tokens = self.soft_moe(combined_tokens)
         fused_tokens = self.norm(combined_tokens + fused_tokens)
         
-        # 4. Hierarchical Prediction
-        out = self.output_head(fused_tokens) # (B, total_tokens, pred_len)
+        # 4. Prediction (in normalized space)
+        out = self.output_head(fused_tokens) # (B, E*Q, pred_len)
         output = self.aggregate(out) # (B, n_features, pred_len)
+
+        # 5. Inverse RevIN (De-normalization)
+        output = output * std + mean
 
         if flag == 'test':
             return output
@@ -159,18 +135,12 @@ class FusionModelV3(nn.Module):
             return output, self.loss_func(output, batch['target_power'])
 
     def loss_func(self, pred, target):
-        """
-        Combined Loss: Huber (Robustness) + Trend (Gradient matching)
-        """
         huber = nn.HuberLoss(delta=1.0)
         mse = nn.MSELoss()
-        
         loss_val = huber(pred, target)
-        
         if pred.shape[-1] > 1:
             diff_pred = pred[:, :, 1:] - pred[:, :, :-1]
             diff_target = target[:, :, 1:] - target[:, :, :-1]
             loss_trend = mse(diff_pred, diff_target)
             return loss_val + 0.5 * loss_trend
-        
         return loss_val
