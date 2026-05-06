@@ -46,11 +46,10 @@ class FastSoftMoE(nn.Module):
 
 class FusionModelV3(nn.Module):
     """
-    FusionModel V3 Tensor version (Adaptive RevIN Edition):
+    FusionModel V3 Tensor version (Clean Direct Regression):
     - Independent learnable queries for each expert.
-    - Adaptive Reversible Instance Normalization (Adaptive RevIN):
-      Uses learnable affine weights/biases to adjust the impact of input statistics.
-    - Training occurs in normalized space for stability.
+    - Global SoftMoE fusion.
+    - Direct regression on physical power values (No RevIN/Normalization).
     """
     def __init__(self, models_dict, seq_len, pred_len, n_features, 
                  queries_per_expert=8, d_fusion=512, num_experts=6, device='cuda'):
@@ -73,6 +72,7 @@ class FusionModelV3(nn.Module):
         self.projectors = nn.ModuleDict()
         self.expert_attns = nn.ModuleDict()
         for name in self.expert_names:
+            # Dimension mapping based on expert hidden state output
             d_in = {'m1': 512, 'm2': 256, 'm3': 384, 'm4': 512}.get(name, d_fusion)
             self.projectors[name] = nn.Linear(d_in, d_fusion)
             self.expert_attns[name] = nn.MultiheadAttention(d_fusion, num_heads=8, batch_first=True)
@@ -85,12 +85,8 @@ class FusionModelV3(nn.Module):
         self.output_head = nn.Linear(d_fusion, pred_len)
         self.total_tokens = queries_per_expert * num_exp
         self.aggregate = nn.Conv1d(self.total_tokens, self.n_features, 1)
-
-        # 5. Adaptive RevIN Parameters
-        self.affine_weight = nn.Parameter(torch.ones(1, n_features, 1))
-        self.affine_bias = nn.Parameter(torch.zeros(1, n_features, 1))
         
-        # Balanced Initialization
+        # Initialization
         nn.init.normal_(self.output_head.weight, std=0.01)
         nn.init.zeros_(self.output_head.bias)
         self.to(device)
@@ -98,17 +94,11 @@ class FusionModelV3(nn.Module):
     def forward(self, batch_tensor, batch, flag='test'):
         B = batch['observe_power'].shape[0]
         
-        # 0. Calculate statistics (RevIN)
-        x_raw = batch['observe_power']
-        if x_raw.dim() == 2:
-            x_raw = x_raw.unsqueeze(-1)
-        mean = x_raw.mean(dim=1, keepdim=True).transpose(1, 2) # (B, C, 1)
-        std = torch.sqrt(x_raw.var(dim=1, keepdim=True, unbiased=False) + 1e-5).transpose(1, 2) # (B, C, 1)
-
-        # 1. Distill features
+        # 1. Distill features using per-expert dedicated queries
         all_expert_summaries = []
         for name in self.expert_names:
             h = batch_tensor[name]
+            # Handle structured expert features
             if name == 'm2' and h.dim() == 4: h = h.flatten(1, 2)
             elif h.dim() == 2: h = h.unsqueeze(1)
             
@@ -117,32 +107,25 @@ class FusionModelV3(nn.Module):
             summary, _ = self.expert_attns[name](q, h_proj, h_proj)
             all_expert_summaries.append(summary)
 
-        # 2. Global Interaction
-        combined_tokens = torch.cat(all_expert_summaries, dim=1)
+        # 2. Global Interaction with SoftMoE
+        combined_tokens = torch.cat(all_expert_summaries, dim=1) # (B, E*Q, D)
         fused_tokens = self.soft_moe(combined_tokens)
         fused_tokens = self.norm(combined_tokens + fused_tokens)
         
-        # 3. Prediction in Normalized Space
-        output_norm = self.aggregate(self.output_head(fused_tokens))
-
-        # 4. Adaptive De-normalization
-        # Uses learned weight and bias to adjust the influence of input statistics
-        output_final = output_norm * (std * self.affine_weight) + (mean + self.affine_bias)
+        # 3. Final Prediction (Direct physical scale)
+        out = self.output_head(fused_tokens) # (B, E*Q, pred_len)
+        output = self.aggregate(out) # (B, n_features, pred_len)
 
         if flag == 'test':
-            return output_final
+            return output
         else:
-            # 5. Target Normalization (Inverse of Step 4)
+            # 4. Loss calculation directly on physical values
             target_raw = batch['target_power']
             if target_raw.dim() == 2:
                 target_raw = target_raw.unsqueeze(1)
             
-            # For loss calculation, we match the scale of output_norm
-            # Formula: output_norm = (output_final - (mean + bias)) / (std * weight)
-            target_norm = (target_raw - (mean + self.affine_bias)) / (std * self.affine_weight + 1e-5)
-            
-            loss = self.loss_func(output_norm, target_norm)
-            return output_final, loss
+            loss = self.loss_func(output, target_raw)
+            return output, loss
 
     def loss_func(self, pred, target):
         huber = nn.HuberLoss(delta=1.0)
