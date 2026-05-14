@@ -7,31 +7,30 @@ from layers.revin import RevIN
 
 class ExpertTokenAdapter(nn.Module):
     """
-    Maps an expert hidden tensor with arbitrary token shape to aligned latent
-    tokens shaped (B, output_tokens, d_model).
+    First half of the split head: align expert hidden tokens to (B, K, d_model).
+
+    It keeps the operation deliberately simple:
+    - flatten non-feature dimensions into tokens;
+    - project only the last hidden dimension to d_model;
+    - optionally remap the token count to output_tokens.
     """
 
-    def __init__(self, input_dim, output_tokens, d_model=128, dropout=0.0, num_heads=4):
+    def __init__(self, input_dim, input_tokens, output_tokens, d_model=128, dropout=0.0):
         super().__init__()
+        self.input_tokens = input_tokens
         self.output_tokens = output_tokens
         self.d_model = d_model
 
-        self.projector = nn.Sequential(
+        self.feature_projector = nn.Sequential(
             nn.LayerNorm(input_dim),
             nn.Linear(input_dim, d_model),
-            nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(d_model, d_model),
         )
-        self.queries = nn.Parameter(torch.randn(1, output_tokens, d_model) * 0.02)
-        self.attn = nn.MultiheadAttention(
-            d_model,
-            num_heads=num_heads,
-            dropout=dropout,
-            batch_first=True,
+        self.token_mixer = (
+            None
+            if input_tokens == output_tokens
+            else nn.Linear(input_tokens, output_tokens)
         )
-        self.norm = nn.LayerNorm(d_model)
-        self.dropout = nn.Dropout(dropout)
 
     def _as_tokens(self, hidden):
         if hidden.dim() == 2:
@@ -44,47 +43,109 @@ class ExpertTokenAdapter(nn.Module):
 
     def forward(self, hidden):
         tokens = self._as_tokens(hidden)
-        tokens = self.projector(tokens)
-        queries = self.queries.expand(tokens.shape[0], -1, -1)
-        aligned, _ = self.attn(queries, tokens, tokens)
-        return self.norm(queries + self.dropout(aligned))
+        tokens = self.feature_projector(tokens)
+
+        if tokens.shape[1] == self.output_tokens:
+            return tokens
+        if self.token_mixer is None:
+            raise ValueError(
+                f"Expected {self.output_tokens} aligned tokens, got {tokens.shape[1]}."
+            )
+
+        tokens = tokens.transpose(1, 2)
+        tokens = self.token_mixer(tokens)
+        return tokens.transpose(1, 2)
 
 
-class TokenForecastHead(nn.Module):
-    """
-    Forecast head shared in structure across experts after latent alignment.
-    Each aligned token emits a forecast; a token gate aggregates them.
-    """
+class M1AlignedForecastHead(nn.Module):
+    """Second half for M1-style linear readout: flatten tokens then linear."""
 
-    def __init__(self, d_model=128, pred_len=192, n_features=1, dropout=0.0):
+    def __init__(self, token_count, d_model=128, pred_len=192, dropout=0.0, **_):
         super().__init__()
-        hidden_dim = max(d_model // 2, 1)
-        self.pred_len = pred_len
-        self.n_features = n_features
+        self.flatten = nn.Flatten(start_dim=1)
+        self.linear = nn.Linear(token_count * d_model, pred_len)
+        self.dropout = nn.Dropout(dropout)
 
-        self.token_head = nn.Sequential(
-            nn.LayerNorm(d_model),
-            nn.Linear(d_model, d_model),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_model, n_features * pred_len),
-        )
-        self.token_gate = nn.Sequential(
-            nn.LayerNorm(d_model),
-            nn.Linear(d_model, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, 1),
+    def forward(self, tokens):
+        tokens = self.flatten(tokens)
+        tokens = self.linear(tokens)
+        tokens = self.dropout(tokens)
+        return tokens
+
+
+class M2AlignedForecastHead(nn.Module):
+    """Second half for M2-style independent token regressors then mean."""
+
+    def __init__(self, token_count, d_model=128, pred_len=192, dropout=0.0, **_):
+        super().__init__()
+        self.token_count = token_count
+        self.regression_heads = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Linear(d_model, d_model * 2),
+                    nn.GELU(),
+                    nn.Dropout(dropout),
+                    nn.Linear(d_model * 2, pred_len),
+                )
+                for _ in range(token_count)
+            ]
         )
 
     def forward(self, tokens):
-        batch_size, token_count, _ = tokens.shape
-        pred = self.token_head(tokens).view(
-            batch_size, token_count, self.n_features, self.pred_len
+        if tokens.shape[1] != self.token_count:
+            raise ValueError(
+                f"M2 aligned token count must be {self.token_count}, "
+                f"got {tokens.shape[1]}."
+            )
+        preds = [
+            self.regression_heads[i](tokens[:, i, :])
+            for i in range(self.token_count)
+        ]
+        return torch.stack(preds, dim=1).mean(dim=1)
+
+
+class M3AlignedForecastHead(M1AlignedForecastHead):
+    """Second half for M3-style high-dimensional flattened linear readout."""
+
+    def __init__(self, token_count, d_model=128, pred_len=192, dropout=0.3, **_):
+        super().__init__(
+            token_count=token_count,
+            d_model=d_model,
+            pred_len=pred_len,
+            dropout=dropout,
         )
-        weight = F.softmax(self.token_gate(tokens), dim=1).view(
-            batch_size, token_count, 1, 1
-        )
-        return (pred * weight).sum(dim=1)
+
+
+class M4AlignedForecastHead(nn.Module):
+    """Second half for M4-style MLP readout from flattened aligned tokens."""
+
+    def __init__(self, token_count, d_model=128, pred_len=192, dropout=0.0, **_):
+        super().__init__()
+        self.flatten = nn.Flatten(start_dim=1)
+        layers = []
+        hidden_sizes = [1024, 256, 64]
+        prev_size = token_count * d_model
+        for hidden_size in hidden_sizes:
+            layers.append(nn.Linear(prev_size, hidden_size))
+            layers.append(nn.LayerNorm(hidden_size))
+            layers.append(nn.ReLU())
+            layers.append(nn.Dropout(dropout))
+            prev_size = hidden_size
+
+        layers.append(nn.Linear(prev_size, pred_len))
+        self.model = nn.Sequential(*layers)
+
+    def forward(self, tokens):
+        tokens = self.flatten(tokens)
+        return self.model(tokens)
+
+
+ALIGNED_HEAD_REGISTRY = {
+    "m1": M1AlignedForecastHead,
+    "m2": M2AlignedForecastHead,
+    "m3": M3AlignedForecastHead,
+    "m4": M4AlignedForecastHead,
+}
 
 
 class AlignedExpertHeadFusion(nn.Module):
@@ -97,7 +158,8 @@ class AlignedExpertHeadFusion(nn.Module):
     """
 
     DEFAULT_EXPERT_DIMS = {"m1": 128, "m2": 512, "m3": 384, "m4": 256}
-    DEFAULT_ALIGNED_TOKENS = {"m1": 9, "m2": 2, "m3": 16, "m4": 9}
+    DEFAULT_INPUT_TOKENS = {"m1": 9, "m2": 2, "m3": 162, "m4": 45}
+    DEFAULT_ALIGNED_TOKENS = {"m1": 9, "m2": 2, "m3": 162, "m4": 45}
     SUPPORTED_LOSSES = {"mse", "mae", "huber"}
 
     def __init__(
@@ -128,8 +190,8 @@ class AlignedExpertHeadFusion(nn.Module):
 
         self._validate_loss_type(loss_type)
         resolved_dims = self._resolve_expert_dims(expert_dims)
+        resolved_input_tokens = self._resolve_input_tokens()
         resolved_tokens = self._resolve_aligned_tokens(aligned_tokens)
-        num_heads = self._choose_num_heads(self.d_fusion)
 
         self.pv_revin_layer = RevIN(1, affine=1, subtract_last=0)
         self.adapters = nn.ModuleDict()
@@ -137,15 +199,16 @@ class AlignedExpertHeadFusion(nn.Module):
         for name in self.expert_names:
             self.adapters[name] = ExpertTokenAdapter(
                 input_dim=resolved_dims[name],
+                input_tokens=resolved_input_tokens[name],
                 output_tokens=resolved_tokens[name],
                 d_model=self.d_fusion,
                 dropout=dropout,
-                num_heads=num_heads,
             )
-            self.prediction_heads[name] = TokenForecastHead(
+            head_cls = ALIGNED_HEAD_REGISTRY[name]
+            self.prediction_heads[name] = head_cls(
+                token_count=resolved_tokens[name],
                 d_model=self.d_fusion,
                 pred_len=pred_len,
-                n_features=n_features,
                 dropout=dropout,
             )
 
@@ -156,13 +219,6 @@ class AlignedExpertHeadFusion(nn.Module):
         if loss_type not in cls.SUPPORTED_LOSSES:
             valid = ", ".join(sorted(cls.SUPPORTED_LOSSES))
             raise ValueError(f"Unknown loss_type={loss_type!r}. Valid: {valid}.")
-
-    @staticmethod
-    def _choose_num_heads(d_model):
-        for num_heads in (8, 4, 2, 1):
-            if d_model % num_heads == 0:
-                return num_heads
-        return 1
 
     def _resolve_expert_names(self, models_dict, expert_names):
         if expert_names is not None:
@@ -195,6 +251,16 @@ class AlignedExpertHeadFusion(nn.Module):
                 + ". AlignedExpertHeadFusion needs each expert hidden dimension."
             )
         return resolved
+
+    def _resolve_input_tokens(self):
+        missing = [
+            name for name in self.expert_names if name not in self.DEFAULT_INPUT_TOKENS
+        ]
+        if missing:
+            raise ValueError(
+                "Missing default input token counts for: " + ", ".join(missing)
+            )
+        return dict(self.DEFAULT_INPUT_TOKENS)
 
     def _resolve_aligned_tokens(self, aligned_tokens):
         resolved = dict(self.DEFAULT_ALIGNED_TOKENS)
