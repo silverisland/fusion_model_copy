@@ -6,6 +6,7 @@ import torch.nn as nn
 from .fusion.base import FusionBase
 from .fusion.expert_head import ExpertHeadReconstruction, MultiExpertHeadFusion
 from .fusion.expert_head_v2 import AlignedExpertHeadFusion
+from .fusion.expert_head_v3 import CompressedExpertHeadFusion
 from .fusion.legacy import FusionModel as FusionLegacy
 from .fusion.tensor_v3 import FusionModelV3 as FusionTensorV3
 from .fusion.v2 import FusionModel as FusionV2
@@ -19,6 +20,7 @@ FUSION_REGISTRY = {
     "expert_head": ExpertHeadReconstruction,
     "multi_expert_head": MultiExpertHeadFusion,
     "expert_head_v2": AlignedExpertHeadFusion,
+    "expert_head_v3": CompressedExpertHeadFusion,
     "legacy": FusionLegacy,
     "v2": FusionV2,
     "v3": FusionModelV3,
@@ -33,6 +35,7 @@ HIDDEN_ONLY_FUSION_VERSIONS = {
     "expert_head",
     "multi_expert_head",
     "expert_head_v2",
+    "expert_head_v3",
     "v4",
     "v5",
     "tensor_v3",
@@ -127,6 +130,7 @@ def build_fusion_model(args, base_models=None, device=None):
     expert_dims = parse_expert_dims(getattr(args, "fusion_expert_dims", None))
     aligned_tokens = parse_expert_dims(getattr(args, "fusion_aligned_tokens", None))
     expert_names = parse_expert_names(getattr(args, "fusion_expert_names", None))
+    aligned_token_count = getattr(args, "fusion_aligned_token_count", None)
     d_fusion = getattr(args, "fusion_d_model", None)
     dropout = getattr(args, "fusion_dropout", None)
     target_key = getattr(args, "target_key", None)
@@ -142,6 +146,7 @@ def build_fusion_model(args, base_models=None, device=None):
         "expert_dims": expert_dims,
         "expert_names": expert_names,
         "aligned_tokens": aligned_tokens,
+        "aligned_token_count": aligned_token_count,
         "d_fusion": d_fusion,
         "dropout": dropout,
         "target_key": target_key,

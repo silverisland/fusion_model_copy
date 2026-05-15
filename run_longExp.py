@@ -19,7 +19,7 @@ def main():
     parser.add_argument('--model', type=str, required=True, default='FusionModel',
                         help='model name, options: [FusionModel, DLinear, PatchTST, iTransformer, TimesNet]')
     parser.add_argument('--fusion_version', type=str, default='base',
-                        choices=['base', 'expert_head', 'multi_expert_head', 'expert_head_v2', 'legacy', 'v2', 'v3', 'v4', 'v5', 'tensor_v3'],
+                        choices=['base', 'expert_head', 'multi_expert_head', 'expert_head_v2', 'expert_head_v3', 'legacy', 'v2', 'v3', 'v4', 'v5', 'tensor_v3'],
                         help='fusion model version selected by models/factory.py')
     parser.add_argument('--fusion_expert_name', type=str, default='m1',
                         choices=['m1', 'm2', 'm3', 'm4'],
@@ -34,6 +34,8 @@ def main():
                         help="expert hidden dims, e.g. 'm1:512,m2:256,m3:384,m4:512'")
     parser.add_argument('--fusion_aligned_tokens', type=str, default=None,
                         help="aligned token counts, e.g. 'm1:9,m2:2,m4:9'")
+    parser.add_argument('--fusion_aligned_token_count', type=int, default=None,
+                        help='shared aligned token count for expert_head_v3')
     parser.add_argument('--fusion_loss', type=str, default=None,
                         choices=['mse', 'mae', 'huber'],
                         help='loss type for fusion versions that support it')
@@ -110,6 +112,11 @@ def main():
     )
     fusion_expert_names = args.fusion_expert_names or args.fusion_expert_name
     fusion_aligned_tokens = args.fusion_aligned_tokens or 'default'
+    fusion_aligned_token_count = (
+        args.fusion_aligned_token_count
+        if args.fusion_aligned_token_count is not None
+        else 'default'
+    )
     setting = (
         f'{args.model_id}_{args.model}_{args.fusion_version}_{args.data}'
         f'_sl{args.seq_len}_pl{args.pred_len}_bs{args.batch_size}'
@@ -117,6 +124,7 @@ def main():
         f'_mom{args.muon_momentum}_ns{args.muon_ns_steps}'
         f'_loss{fusion_loss}_aux{fusion_aux}_drop{fusion_dropout}'
         f'_df{fusion_d_model}_tok{fusion_aligned_tokens}'
+        f'_tokcnt{fusion_aligned_token_count}'
         f'_expert{fusion_expert_names}_{args.des}'
     )
 
