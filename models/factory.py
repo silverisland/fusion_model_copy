@@ -131,6 +131,7 @@ def build_fusion_model(args, base_models=None, device=None):
     aligned_tokens = parse_expert_dims(getattr(args, "fusion_aligned_tokens", None))
     expert_names = parse_expert_names(getattr(args, "fusion_expert_names", None))
     aligned_token_count = getattr(args, "fusion_aligned_token_count", None)
+    adapter_type = getattr(args, "fusion_adapter_type", None)
     d_fusion = getattr(args, "fusion_d_model", None)
     dropout = getattr(args, "fusion_dropout", None)
     target_key = getattr(args, "target_key", None)
@@ -147,6 +148,7 @@ def build_fusion_model(args, base_models=None, device=None):
         "expert_names": expert_names,
         "aligned_tokens": aligned_tokens,
         "aligned_token_count": aligned_token_count,
+        "adapter_type": adapter_type,
         "d_fusion": d_fusion,
         "dropout": dropout,
         "target_key": target_key,

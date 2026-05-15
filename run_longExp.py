@@ -36,6 +36,9 @@ def main():
                         help="aligned token counts, e.g. 'm1:9,m2:2,m4:9'")
     parser.add_argument('--fusion_aligned_token_count', type=int, default=None,
                         help='shared aligned token count for expert_head_v3')
+    parser.add_argument('--fusion_adapter_type', type=str, default=None,
+                        choices=['linear', 'conv', 'depthwise_conv'],
+                        help='token compression adapter type for expert_head_v3')
     parser.add_argument('--fusion_loss', type=str, default=None,
                         choices=['mse', 'mae', 'huber'],
                         help='loss type for fusion versions that support it')
@@ -117,6 +120,7 @@ def main():
         if args.fusion_aligned_token_count is not None
         else 'default'
     )
+    fusion_adapter_type = args.fusion_adapter_type or 'default'
     setting = (
         f'{args.model_id}_{args.model}_{args.fusion_version}_{args.data}'
         f'_sl{args.seq_len}_pl{args.pred_len}_bs{args.batch_size}'
@@ -125,6 +129,7 @@ def main():
         f'_loss{fusion_loss}_aux{fusion_aux}_drop{fusion_dropout}'
         f'_df{fusion_d_model}_tok{fusion_aligned_tokens}'
         f'_tokcnt{fusion_aligned_token_count}'
+        f'_adapter{fusion_adapter_type}'
         f'_expert{fusion_expert_names}_{args.des}'
     )
 

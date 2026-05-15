@@ -9,27 +9,70 @@ class CompressedTokenAdapter(nn.Module):
     """
     Compresses each expert hidden tensor to a fixed token grid (B, K, d_model).
 
-    The operation is intentionally simple for this experiment:
-    hidden -> flatten non-feature dims as tokens -> Linear(D_i, d_model)
-    -> Linear(T_i, K) over the token dimension.
+    The adapter_type controls token compression after the last hidden dimension
+    is projected to d_model:
+    - linear: Linear(T_i, K) over the token dimension.
+    - conv: Conv1d over tokens + AdaptiveAvgPool1d(K).
+    - depthwise_conv: depthwise Conv1d + pointwise Conv1d + AdaptiveAvgPool1d(K).
     """
 
-    def __init__(self, input_dim, input_tokens, token_count=3, d_model=128, dropout=0.0):
+    SUPPORTED_ADAPTERS = {"linear", "conv", "depthwise_conv"}
+
+    def __init__(
+        self,
+        input_dim,
+        input_tokens,
+        token_count=3,
+        d_model=128,
+        dropout=0.0,
+        adapter_type="linear",
+    ):
         super().__init__()
+        if adapter_type not in self.SUPPORTED_ADAPTERS:
+            valid = ", ".join(sorted(self.SUPPORTED_ADAPTERS))
+            raise ValueError(f"Unknown adapter_type={adapter_type!r}. Valid: {valid}.")
+
         self.input_tokens = input_tokens
         self.token_count = token_count
         self.d_model = d_model
+        self.adapter_type = adapter_type
 
         self.feature_projector = nn.Sequential(
             nn.LayerNorm(input_dim),
             nn.Linear(input_dim, d_model),
             nn.Dropout(dropout),
         )
-        self.token_projector = (
-            nn.Identity()
-            if input_tokens == token_count
-            else nn.Linear(input_tokens, token_count)
-        )
+
+        if adapter_type == "linear":
+            self.token_projector = (
+                nn.Identity()
+                if input_tokens == token_count
+                else nn.Linear(input_tokens, token_count)
+            )
+        elif adapter_type == "conv":
+            self.token_projector = nn.Sequential(
+                nn.Conv1d(d_model, d_model, kernel_size=3, padding=1),
+                nn.GELU(),
+                nn.Conv1d(d_model, d_model, kernel_size=1),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.AdaptiveAvgPool1d(token_count),
+            )
+        else:
+            self.token_projector = nn.Sequential(
+                nn.Conv1d(
+                    d_model,
+                    d_model,
+                    kernel_size=3,
+                    padding=1,
+                    groups=d_model,
+                ),
+                nn.GELU(),
+                nn.Conv1d(d_model, d_model, kernel_size=1),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.AdaptiveAvgPool1d(token_count),
+            )
 
     def _as_tokens(self, hidden):
         if hidden.dim() == 2:
@@ -165,6 +208,7 @@ class CompressedExpertHeadFusion(nn.Module):
         expert_dims=None,
         expert_names=None,
         aligned_token_count=3,
+        adapter_type="linear",
         d_fusion=None,
         dropout=0.0,
         target_key="observe_power_future",
@@ -178,6 +222,7 @@ class CompressedExpertHeadFusion(nn.Module):
         self.n_features = n_features
         self.d_fusion = 128 if d_fusion is None else d_fusion
         self.aligned_token_count = aligned_token_count
+        self.adapter_type = adapter_type
         self.target_key = target_key
         self.loss_type = loss_type
         self.aux_loss_weight = aux_loss_weight
@@ -197,6 +242,7 @@ class CompressedExpertHeadFusion(nn.Module):
                 token_count=aligned_token_count,
                 d_model=self.d_fusion,
                 dropout=dropout,
+                adapter_type=adapter_type,
             )
             head_cls = COMPRESSED_HEAD_REGISTRY[name]
             self.prediction_heads[name] = head_cls(
@@ -344,6 +390,7 @@ class CompressedExpertHeadFusion(nn.Module):
 
         info = {
             "expert_names": self.expert_names,
+            "adapter_type": self.adapter_type,
             "compressed_by_expert": compressed_by_expert,
             "pred_by_expert": pred_by_expert,
             "pred_stack": pred_stack,
