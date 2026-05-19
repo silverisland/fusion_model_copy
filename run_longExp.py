@@ -19,7 +19,7 @@ def main():
     parser.add_argument('--model', type=str, required=True, default='FusionModel',
                         help='model name, options: [FusionModel, DLinear, PatchTST, iTransformer, TimesNet]')
     parser.add_argument('--fusion_version', type=str, default='base',
-                        choices=['base', 'expert_head', 'multi_expert_head', 'expert_head_v2', 'expert_head_v3', 'expert_head_v4', 'legacy', 'v2', 'v3', 'v4', 'v5', 'tensor_v3'],
+                        choices=['base', 'expert_head', 'multi_expert_head', 'expert_head_v2', 'expert_head_v3', 'expert_head_v4', 'expert_head_v5', 'legacy', 'v2', 'v3', 'v4', 'v5', 'tensor_v3'],
                         help='fusion model version selected by models/factory.py')
     parser.add_argument('--fusion_expert_name', type=str, default='m1',
                         choices=['m1', 'm2', 'm3', 'm4'],
@@ -45,13 +45,13 @@ def main():
     parser.add_argument('--fusion_aux_loss_weight', type=float, default=None,
                         help='auxiliary expert-head loss weight for multi-head fusion')
     parser.add_argument('--fusion_orth_loss_weight', type=float, default=None,
-                        help='orthogonal auxiliary loss weight for expert_head_v4')
+                        help='orthogonal auxiliary loss weight for expert_head_v4/v5')
     parser.add_argument('--fusion_attention_heads', type=int, default=None,
-                        help='attention heads for expert_head_v4 fusion')
+                        help='attention heads for expert_head_v4/v5 fusion')
     parser.add_argument('--fusion_attention_layers', type=int, default=None,
-                        help='attention layers for expert_head_v4 fusion')
+                        help='attention layers for expert_head_v4/v5 fusion')
     parser.add_argument('--fusion_attention_query_tokens', type=int, default=None,
-                        help='learned query token count for expert_head_v4 fusion')
+                        help='learned query token count for expert_head_v4/v5 fusion')
     parser.add_argument('--target_key', type=str, default='observe_power_future',
                         help='target tensor key used by fusion models')
 
