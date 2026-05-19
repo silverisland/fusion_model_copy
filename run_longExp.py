@@ -19,7 +19,7 @@ def main():
     parser.add_argument('--model', type=str, required=True, default='FusionModel',
                         help='model name, options: [FusionModel, DLinear, PatchTST, iTransformer, TimesNet]')
     parser.add_argument('--fusion_version', type=str, default='base',
-                        choices=['base', 'expert_head', 'multi_expert_head', 'expert_head_v2', 'expert_head_v3', 'legacy', 'v2', 'v3', 'v4', 'v5', 'tensor_v3'],
+                        choices=['base', 'expert_head', 'multi_expert_head', 'expert_head_v2', 'expert_head_v3', 'expert_head_v4', 'legacy', 'v2', 'v3', 'v4', 'v5', 'tensor_v3'],
                         help='fusion model version selected by models/factory.py')
     parser.add_argument('--fusion_expert_name', type=str, default='m1',
                         choices=['m1', 'm2', 'm3', 'm4'],
@@ -38,12 +38,20 @@ def main():
                         help='shared aligned token count for expert_head_v3')
     parser.add_argument('--fusion_adapter_type', type=str, default=None,
                         choices=['linear', 'conv', 'depthwise_conv'],
-                        help='token compression adapter type for expert_head_v3')
+                        help='token compression adapter type for expert_head_v3/v4')
     parser.add_argument('--fusion_loss', type=str, default=None,
                         choices=['mse', 'mae', 'huber'],
                         help='loss type for fusion versions that support it')
     parser.add_argument('--fusion_aux_loss_weight', type=float, default=None,
                         help='auxiliary expert-head loss weight for multi-head fusion')
+    parser.add_argument('--fusion_orth_loss_weight', type=float, default=None,
+                        help='orthogonal auxiliary loss weight for expert_head_v4')
+    parser.add_argument('--fusion_attention_heads', type=int, default=None,
+                        help='attention heads for expert_head_v4 fusion')
+    parser.add_argument('--fusion_attention_layers', type=int, default=None,
+                        help='attention layers for expert_head_v4 fusion')
+    parser.add_argument('--fusion_attention_query_tokens', type=int, default=None,
+                        help='learned query token count for expert_head_v4 fusion')
     parser.add_argument('--target_key', type=str, default='observe_power_future',
                         help='target tensor key used by fusion models')
 
@@ -121,6 +129,26 @@ def main():
         else 'default'
     )
     fusion_adapter_type = args.fusion_adapter_type or 'default'
+    fusion_orth = (
+        args.fusion_orth_loss_weight
+        if args.fusion_orth_loss_weight is not None
+        else 'default'
+    )
+    fusion_attention_heads = (
+        args.fusion_attention_heads
+        if args.fusion_attention_heads is not None
+        else 'default'
+    )
+    fusion_attention_layers = (
+        args.fusion_attention_layers
+        if args.fusion_attention_layers is not None
+        else 'default'
+    )
+    fusion_attention_query_tokens = (
+        args.fusion_attention_query_tokens
+        if args.fusion_attention_query_tokens is not None
+        else 'default'
+    )
     setting = (
         f'{args.model_id}_{args.model}_{args.fusion_version}_{args.data}'
         f'_sl{args.seq_len}_pl{args.pred_len}_bs{args.batch_size}'
@@ -130,6 +158,8 @@ def main():
         f'_df{fusion_d_model}_tok{fusion_aligned_tokens}'
         f'_tokcnt{fusion_aligned_token_count}'
         f'_adapter{fusion_adapter_type}'
+        f'_orth{fusion_orth}_attn{fusion_attention_heads}x{fusion_attention_layers}'
+        f'_query{fusion_attention_query_tokens}'
         f'_expert{fusion_expert_names}_{args.des}'
     )
 

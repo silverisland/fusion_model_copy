@@ -7,6 +7,7 @@ from .fusion.base import FusionBase
 from .fusion.expert_head import ExpertHeadReconstruction, MultiExpertHeadFusion
 from .fusion.expert_head_v2 import AlignedExpertHeadFusion
 from .fusion.expert_head_v3 import CompressedExpertHeadFusion
+from .fusion.expert_head_v4 import OrthogonalAttentionExpertHeadFusion
 from .fusion.legacy import FusionModel as FusionLegacy
 from .fusion.tensor_v3 import FusionModelV3 as FusionTensorV3
 from .fusion.v2 import FusionModel as FusionV2
@@ -21,6 +22,7 @@ FUSION_REGISTRY = {
     "multi_expert_head": MultiExpertHeadFusion,
     "expert_head_v2": AlignedExpertHeadFusion,
     "expert_head_v3": CompressedExpertHeadFusion,
+    "expert_head_v4": OrthogonalAttentionExpertHeadFusion,
     "legacy": FusionLegacy,
     "v2": FusionV2,
     "v3": FusionModelV3,
@@ -36,6 +38,7 @@ HIDDEN_ONLY_FUSION_VERSIONS = {
     "multi_expert_head",
     "expert_head_v2",
     "expert_head_v3",
+    "expert_head_v4",
     "v4",
     "v5",
     "tensor_v3",
@@ -138,6 +141,10 @@ def build_fusion_model(args, base_models=None, device=None):
     loss_type = getattr(args, "fusion_loss", None)
     expert_name = getattr(args, "fusion_expert_name", None)
     aux_loss_weight = getattr(args, "fusion_aux_loss_weight", None)
+    orth_loss_weight = getattr(args, "fusion_orth_loss_weight", None)
+    attention_heads = getattr(args, "fusion_attention_heads", None)
+    attention_layers = getattr(args, "fusion_attention_layers", None)
+    attention_query_tokens = getattr(args, "fusion_attention_query_tokens", None)
 
     constructor_kwargs = {
         "models_dict": base_models,
@@ -155,6 +162,10 @@ def build_fusion_model(args, base_models=None, device=None):
         "loss_type": loss_type,
         "expert_name": expert_name,
         "aux_loss_weight": aux_loss_weight,
+        "orth_loss_weight": orth_loss_weight,
+        "attention_heads": attention_heads,
+        "attention_layers": attention_layers,
+        "attention_query_tokens": attention_query_tokens,
         "device": device,
     }
     constructor_kwargs = _filter_constructor_kwargs(model_cls, constructor_kwargs)
