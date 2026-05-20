@@ -6,6 +6,26 @@ import torch.nn.functional as F
 
 from layers.revin import RevIN
 
+try:
+    from torch.nn.utils.parametrizations import orthogonal as orthogonal_param
+
+    HAS_ORTHOGONAL_PARAM = True
+except Exception:
+    HAS_ORTHOGONAL_PARAM = False
+
+
+def orthogonal_linear(in_features, out_features):
+    """
+    Linear layer with a hard orthogonal parametrization when PyTorch supports it.
+    Falls back to orthogonal initialization while keeping the same interface.
+    """
+    layer = nn.Linear(in_features, out_features, bias=False)
+    if HAS_ORTHOGONAL_PARAM:
+        return orthogonal_param(layer)
+
+    nn.init.orthogonal_(layer.weight)
+    return layer
+
 
 class FlattenOrthogonalAdapter(nn.Module):
     """
@@ -36,7 +56,7 @@ class FlattenOrthogonalAdapter(nn.Module):
             [
                 nn.Sequential(
                     nn.LayerNorm(input_dim),
-                    nn.Linear(input_dim, d_model),
+                    orthogonal_linear(input_dim, d_model),
                     nn.GELU(),
                     nn.Dropout(dropout),
                 )
@@ -47,7 +67,7 @@ class FlattenOrthogonalAdapter(nn.Module):
             [
                 nn.Sequential(
                     nn.LayerNorm(input_tokens * d_model),
-                    nn.Linear(input_tokens * d_model, d_model),
+                    orthogonal_linear(input_tokens * d_model, d_model),
                     nn.GELU(),
                     nn.Dropout(dropout),
                 )

@@ -219,7 +219,7 @@ class OrthogonalAttentionExpertHeadFusion(nn.Module):
 
     DEFAULT_EXPERT_DIMS = {"m1": 128, "m2": 512, "m3": 384, "m4": 256}
     DEFAULT_INPUT_TOKENS = {"m1": 9, "m2": 2, "m3": 162, "m4": 45}
-    SUPPORTED_LOSSES = {"mse", "mae", "huber"}
+    SUPPORTED_LOSSES = {"mse", "mae", "huber", "rmse"}
 
     def __init__(
         self,
@@ -392,6 +392,8 @@ class OrthogonalAttentionExpertHeadFusion(nn.Module):
     def loss_func(self, pred, target):
         if self.loss_type == "mse":
             return F.mse_loss(pred, target)
+        if self.loss_type == "rmse":
+            return torch.sqrt(F.mse_loss(pred, target) + 1e-8)
         if self.loss_type == "mae":
             return F.l1_loss(pred, target)
         if self.loss_type == "huber":

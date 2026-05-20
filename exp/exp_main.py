@@ -23,6 +23,7 @@ import torch.nn as nn
 from torch import optim
 import os
 import time
+import math
 import yaml
 import warnings
 
@@ -103,6 +104,39 @@ class Exp_Main(Exp_Basic):
 
         raise ValueError(f"Unknown optimizer={self.args.optimizer!r}.")
 
+    def _select_scheduler(self, optimizer, train_steps):
+        lradj = str(self.args.lradj).lower()
+        if lradj in {"none", "constant", "type1", "type2", "type3"}:
+            return None
+
+        total_steps = max(1, train_steps * self.args.train_epochs)
+        if lradj == "onecyclelr":
+            return optim.lr_scheduler.OneCycleLR(
+                optimizer=optimizer,
+                max_lr=self.args.learning_rate,
+                steps_per_epoch=train_steps,
+                epochs=self.args.train_epochs,
+                pct_start=self.args.pct_start,
+            )
+
+        if lradj == "cosine":
+            warmup_steps = max(1, int(total_steps * self.args.pct_start))
+
+            def lr_lambda(step):
+                step = step + 1
+                if step <= warmup_steps:
+                    return step / warmup_steps
+                progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+                cosine = 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
+                return 0.1 + 0.9 * cosine
+
+            return optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+
+        raise ValueError(
+            f"Unknown lradj={self.args.lradj!r}. "
+            "Valid values: none, constant, type1, type2, type3, OneCycleLR, cosine."
+        )
+
     def vali(self, vali_data, vali_loader):
         total_loss = []
         self.model.eval()
@@ -130,11 +164,8 @@ class Exp_Main(Exp_Basic):
         early_stopping = EarlyStopping(patience=self.args.patience, verbose=True)
 
         model_optim = self._select_optimizer()
-        scheduler = optim.lr_scheduler.OneCycleLR(optimizer=model_optim, 
-                                                    max_lr=self.args.learning_rate, 
-                                                    steps_per_epoch=train_steps, 
-                                                    epochs=self.args.train_epochs,
-                                                    pct_start=self.args.pct_start)
+        scheduler = self._select_scheduler(model_optim, train_steps)
+        lradj = str(self.args.lradj).lower()
 
         for epoch in range(self.args.train_epochs):
             iter_count = 0
@@ -161,8 +192,8 @@ class Exp_Main(Exp_Basic):
                 loss.backward()
                 model_optim.step()
 
-                adjust_learning_rate(model_optim, epoch + 1, self.args, printout = False)
-                scheduler.step()    
+                if lradj in {"onecyclelr", "cosine"} and scheduler is not None:
+                    scheduler.step()
 
             print("Epoch: {} cost time: {}".format(epoch + 1, time.time() - epoch_time))
             train_loss = np.average(train_loss)
@@ -175,7 +206,10 @@ class Exp_Main(Exp_Basic):
                 print("Early stopping")
                 break
 
-            adjust_learning_rate(model_optim, epoch + 1, self.args)
+            if lradj in {"onecyclelr", "cosine"} and scheduler is not None:
+                print("Learning rate: {}".format(scheduler.get_last_lr()[0]))
+            elif lradj not in {"none", "constant"}:
+                adjust_learning_rate(model_optim, epoch + 1, self.args)
 
         best_model_path = path + '/' + 'checkpoint.pth'
         self.model.load_state_dict(torch.load(best_model_path))

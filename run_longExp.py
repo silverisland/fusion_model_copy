@@ -40,7 +40,7 @@ def main():
                         choices=['linear', 'conv', 'depthwise_conv'],
                         help='token compression adapter type for expert_head_v3/v4')
     parser.add_argument('--fusion_loss', type=str, default=None,
-                        choices=['mse', 'mae', 'huber'],
+                        choices=['mse', 'mae', 'huber', 'rmse'],
                         help='loss type for fusion versions that support it')
     parser.add_argument('--fusion_aux_loss_weight', type=float, default=None,
                         help='auxiliary expert-head loss weight for multi-head fusion')
@@ -77,7 +77,9 @@ def main():
     parser.add_argument('--muon_ns_steps', type=int, default=5,
                         help='Muon Newton-Schulz iteration steps')
     parser.add_argument('--des', type=str, default='test', help='exp description')
-    parser.add_argument('--lradj', type=str, default='type3', help='adjust learning rate')
+    parser.add_argument('--lradj', type=str, default='none',
+                        choices=['none', 'constant', 'type1', 'type2', 'type3', 'OneCycleLR', 'cosine'],
+                        help='learning rate schedule')
     parser.add_argument('--pct_start', type=float, default=0.3, help='pct start')
 
     # GPU
@@ -153,6 +155,7 @@ def main():
         f'{args.model_id}_{args.model}_{args.fusion_version}_{args.data}'
         f'_sl{args.seq_len}_pl{args.pred_len}_bs{args.batch_size}'
         f'_opt{args.optimizer}_lr{args.learning_rate}_wd{args.weight_decay}'
+        f'_lradj{args.lradj}'
         f'_mom{args.muon_momentum}_ns{args.muon_ns_steps}'
         f'_loss{fusion_loss}_aux{fusion_aux}_drop{fusion_dropout}'
         f'_df{fusion_d_model}_tok{fusion_aligned_tokens}'
