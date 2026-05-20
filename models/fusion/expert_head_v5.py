@@ -19,6 +19,23 @@ def orthogonal_linear(in_features, out_features):
     return layer
 
 
+def init_ensemble_scaling_(weight, init_type):
+    if init_type == "ones":
+        nn.init.ones_(weight)
+    elif init_type == "near-ones":
+        nn.init.normal_(weight, mean=1.0, std=0.02)
+    elif init_type == "normal":
+        nn.init.normal_(weight)
+    elif init_type == "random-signs":
+        with torch.no_grad():
+            weight.bernoulli_(0.5).mul_(2).add_(-1)
+    else:
+        raise ValueError(
+            "ensemble_scaling_init must be one of: "
+            "ones, near-ones, normal, random-signs."
+        )
+
+
 class FlattenOrthogonalAdapter(nn.Module):
     """
     Builds compact expert tokens with a flatten-first prediction-head bias.
@@ -143,7 +160,12 @@ class AttentionBlock(nn.Module):
 
 
 class CrossAttentionForecastHead(nn.Module):
-    """Direct forecast head over compact expert tokens."""
+    """TabM-style direct forecast head over compact expert tokens.
+
+    The attention stack produces one shared forecast representation. The final
+    MLP is evaluated as a parameter-shared ensemble by applying K trainable
+    elementwise scalings to that representation before the shared decoder.
+    """
 
     def __init__(
         self,
@@ -154,20 +176,28 @@ class CrossAttentionForecastHead(nn.Module):
         n_layers=1,
         query_tokens=1,
         dropout=0.0,
+        ensemble_size=4,
+        ensemble_scaling_init="near-ones",
     ):
         super().__init__()
         if d_model % n_heads != 0:
             raise ValueError(
                 f"d_model={d_model} must be divisible by n_heads={n_heads}."
             )
+        if ensemble_size < 1:
+            raise ValueError(f"ensemble_size must be positive, got {ensemble_size}.")
 
         self.expert_names = list(expert_names)
         self.d_model = d_model
         self.query_tokens = query_tokens
+        self.ensemble_size = ensemble_size
         self.expert_embedding = nn.Parameter(
             torch.zeros(len(self.expert_names), 1, d_model)
         )
         self.query = nn.Parameter(torch.randn(1, query_tokens, d_model) * 0.02)
+        self.ensemble_scaling = nn.Parameter(
+            torch.empty(ensemble_size, query_tokens * d_model)
+        )
         self.blocks = nn.ModuleList(
             [
                 AttentionBlock(
@@ -180,12 +210,12 @@ class CrossAttentionForecastHead(nn.Module):
         )
         self.output_norm = nn.LayerNorm(d_model)
         self.forecast_head = nn.Sequential(
-            nn.Flatten(start_dim=1),
             nn.Linear(query_tokens * d_model, d_model * 2),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(d_model * 2, pred_len),
         )
+        init_ensemble_scaling_(self.ensemble_scaling, ensemble_scaling_init)
 
     def forward(self, tokens_by_expert):
         context_parts = []
@@ -200,10 +230,17 @@ class CrossAttentionForecastHead(nn.Module):
             query, weights = block(query, context)
             attention_weights.append(weights)
 
-        forecast = self.forecast_head(self.output_norm(query))
+        forecast_features = self.output_norm(query).flatten(start_dim=1)
+        ensemble_features = (
+            forecast_features.unsqueeze(1) * self.ensemble_scaling.unsqueeze(0)
+        )
+        ensemble_forecast = self.forecast_head(ensemble_features)
+        forecast = ensemble_forecast.mean(dim=1)
         return forecast, {
             "query_tokens": query,
             "context_tokens": context,
+            "forecast_features": forecast_features,
+            "ensemble_forecast": ensemble_forecast,
             "attention_weights": attention_weights,
         }
 
@@ -218,12 +255,21 @@ class FlattenOrthogonalAttentionExpertHeadFusion(nn.Module):
         tokens_i -> cross-attention forecast head -> y_final
 
     Training objective:
-        L = L_pred(y_final, y) + orth_loss_weight * L_orth
+        L = mean_k L_pred(y_k, y) + orth_loss_weight * L_orth
+
+    Inference:
+        y_final = mean_k y_k
     """
 
     DEFAULT_EXPERT_DIMS = {"m1": 128, "m2": 512, "m3": 384, "m4": 256}
     DEFAULT_INPUT_TOKENS = {"m1": 9, "m2": 2, "m3": 162, "m4": 45}
     SUPPORTED_LOSSES = {"mse", "mae", "huber"}
+    SUPPORTED_ENSEMBLE_SCALING_INITS = {
+        "ones",
+        "near-ones",
+        "normal",
+        "random-signs",
+    }
 
     def __init__(
         self,
@@ -242,6 +288,8 @@ class FlattenOrthogonalAttentionExpertHeadFusion(nn.Module):
         attention_heads=4,
         attention_layers=1,
         attention_query_tokens=1,
+        ensemble_size=4,
+        ensemble_scaling_init="near-ones",
         device="cuda",
     ):
         super().__init__()
@@ -256,9 +304,12 @@ class FlattenOrthogonalAttentionExpertHeadFusion(nn.Module):
         self.attention_heads = attention_heads
         self.attention_layers = attention_layers
         self.attention_query_tokens = attention_query_tokens
+        self.ensemble_size = ensemble_size
+        self.ensemble_scaling_init = ensemble_scaling_init
         self.expert_names = self._resolve_expert_names(models_dict, expert_names)
 
         self._validate_loss_type(loss_type)
+        self._validate_ensemble_scaling_init(ensemble_scaling_init)
         resolved_dims = self._resolve_expert_dims(expert_dims)
         resolved_input_tokens = self._resolve_input_tokens()
 
@@ -281,6 +332,8 @@ class FlattenOrthogonalAttentionExpertHeadFusion(nn.Module):
             n_layers=attention_layers,
             query_tokens=attention_query_tokens,
             dropout=dropout,
+            ensemble_size=ensemble_size,
+            ensemble_scaling_init=ensemble_scaling_init,
         )
 
         self.to(device)
@@ -290,6 +343,14 @@ class FlattenOrthogonalAttentionExpertHeadFusion(nn.Module):
         if loss_type not in cls.SUPPORTED_LOSSES:
             valid = ", ".join(sorted(cls.SUPPORTED_LOSSES))
             raise ValueError(f"Unknown loss_type={loss_type!r}. Valid: {valid}.")
+
+    @classmethod
+    def _validate_ensemble_scaling_init(cls, init_type):
+        if init_type not in cls.SUPPORTED_ENSEMBLE_SCALING_INITS:
+            valid = ", ".join(sorted(cls.SUPPORTED_ENSEMBLE_SCALING_INITS))
+            raise ValueError(
+                f"Unknown ensemble_scaling_init={init_type!r}. Valid: {valid}."
+            )
 
     def _resolve_expert_names(self, models_dict, expert_names):
         if expert_names is not None:
@@ -364,6 +425,32 @@ class FlattenOrthogonalAttentionExpertHeadFusion(nn.Module):
             output = output[..., : self.n_features]
         return output.permute(0, 2, 1)
 
+    def _format_ensemble_output(self, output):
+        if output.dim() == 3:
+            output = output.unsqueeze(2)
+        elif output.dim() == 4 and output.shape[2] == self.pred_len:
+            output = output.transpose(2, 3)
+
+        expected_shape = (
+            output.shape[0],
+            self.ensemble_size,
+            self.n_features,
+            self.pred_len,
+        )
+        if tuple(output.shape) != expected_shape:
+            raise ValueError(
+                f"Ensemble prediction output must be {expected_shape}, "
+                f"got {tuple(output.shape)}."
+            )
+        return output
+
+    def _denorm_ensemble_output(self, output):
+        members = [
+            self._denorm_output(output[:, index])
+            for index in range(output.shape[1])
+        ]
+        return torch.stack(members, dim=1)
+
     def _get_target(self, batch):
         if batch is None:
             raise ValueError("batch is required when flag is not 'test'.")
@@ -397,6 +484,13 @@ class FlattenOrthogonalAttentionExpertHeadFusion(nn.Module):
         if self.loss_type == "huber":
             return F.huber_loss(pred, target, delta=1.0)
         raise ValueError(f"Unknown loss_type={self.loss_type!r}")
+
+    def ensemble_loss_func(self, pred, target):
+        losses = [
+            self.loss_func(pred[:, index], target)
+            for index in range(pred.shape[1])
+        ]
+        return torch.stack(losses).mean()
 
     def _within_expert_token_loss(self, compact_tokens):
         if compact_tokens.shape[1] < 2:
@@ -462,11 +556,17 @@ class FlattenOrthogonalAttentionExpertHeadFusion(nn.Module):
         output_norm, fusion_info = self.forecast_head(tokens_by_expert)
         output_norm = self._format_output(output_norm)
         output = self._denorm_output(output_norm)
+        ensemble_output_norm = self._format_ensemble_output(
+            fusion_info["ensemble_forecast"]
+        )
+        ensemble_output = self._denorm_ensemble_output(ensemble_output_norm)
 
         info = {
             "expert_names": self.expert_names,
             "tokens_by_expert": tokens_by_expert,
             "output_norm": output_norm,
+            "ensemble_output_norm": ensemble_output_norm,
+            "ensemble_output": ensemble_output,
             "fusion_info": fusion_info,
         }
 
@@ -476,7 +576,7 @@ class FlattenOrthogonalAttentionExpertHeadFusion(nn.Module):
             return output.squeeze(1)
 
         target = self._get_target(batch)
-        main_loss = self.loss_func(output, target)
+        main_loss = self.ensemble_loss_func(ensemble_output, target)
         if self.orth_loss_weight > 0:
             orth_loss = self.orthogonal_loss(tokens_by_expert)
         else:

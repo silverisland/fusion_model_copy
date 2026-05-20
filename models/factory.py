@@ -151,6 +151,8 @@ def build_fusion_model(args, base_models=None, device=None):
     attention_heads = getattr(args, "fusion_attention_heads", None)
     attention_layers = getattr(args, "fusion_attention_layers", None)
     attention_query_tokens = getattr(args, "fusion_attention_query_tokens", None)
+    ensemble_size = getattr(args, "fusion_ensemble_size", None)
+    ensemble_scaling_init = getattr(args, "fusion_ensemble_scaling_init", None)
 
     constructor_kwargs = {
         "models_dict": base_models,
@@ -172,6 +174,8 @@ def build_fusion_model(args, base_models=None, device=None):
         "attention_heads": attention_heads,
         "attention_layers": attention_layers,
         "attention_query_tokens": attention_query_tokens,
+        "ensemble_size": ensemble_size,
+        "ensemble_scaling_init": ensemble_scaling_init,
         "device": device,
     }
     constructor_kwargs = _filter_constructor_kwargs(model_cls, constructor_kwargs)

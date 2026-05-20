@@ -52,6 +52,11 @@ def main():
                         help='attention layers for expert_head_v4/v5/v6 fusion')
     parser.add_argument('--fusion_attention_query_tokens', type=int, default=None,
                         help='learned query token count for expert_head_v4/v5/v6 fusion')
+    parser.add_argument('--fusion_ensemble_size', type=int, default=None,
+                        help='parallel TabM-style forecast members for expert_head_v5')
+    parser.add_argument('--fusion_ensemble_scaling_init', type=str, default=None,
+                        choices=['ones', 'near-ones', 'normal', 'random-signs'],
+                        help='initialization for expert_head_v5 ensemble scaling')
     parser.add_argument('--target_key', type=str, default='observe_power_future',
                         help='target tensor key used by fusion models')
 
@@ -151,6 +156,12 @@ def main():
         if args.fusion_attention_query_tokens is not None
         else 'default'
     )
+    fusion_ensemble_size = (
+        args.fusion_ensemble_size
+        if args.fusion_ensemble_size is not None
+        else 'default'
+    )
+    fusion_ensemble_scaling_init = args.fusion_ensemble_scaling_init or 'default'
     setting = (
         f'{args.model_id}_{args.model}_{args.fusion_version}_{args.data}'
         f'_sl{args.seq_len}_pl{args.pred_len}_bs{args.batch_size}'
@@ -163,6 +174,7 @@ def main():
         f'_adapter{fusion_adapter_type}'
         f'_orth{fusion_orth}_attn{fusion_attention_heads}x{fusion_attention_layers}'
         f'_query{fusion_attention_query_tokens}'
+        f'_ens{fusion_ensemble_size}_ensinit{fusion_ensemble_scaling_init}'
         f'_expert{fusion_expert_names}_{args.des}'
     )
 
