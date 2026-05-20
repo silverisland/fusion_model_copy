@@ -36,6 +36,123 @@ def init_ensemble_scaling_(weight, init_type):
         )
 
 
+def init_rsqrt_uniform_(weight, d):
+    bound = d ** -0.5
+    nn.init.uniform_(weight, -bound, bound)
+
+
+class LinearEnsemble(nn.Module):
+    """K independent linear output heads applied to (B, K, D)."""
+
+    def __init__(self, in_features, out_features, k, bias=True):
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(k, in_features, out_features))
+        self.bias = nn.Parameter(torch.empty(k, out_features)) if bias else None
+        self.in_features = in_features
+        self.out_features = out_features
+        self.k = k
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        init_rsqrt_uniform_(self.weight, self.in_features)
+        if self.bias is not None:
+            init_rsqrt_uniform_(self.bias, self.in_features)
+
+    def forward(self, x):
+        if x.dim() != 3 or x.shape[1] != self.k:
+            raise ValueError(f"LinearEnsemble expects (B, {self.k}, D), got {tuple(x.shape)}.")
+        x = torch.einsum("bki,kio->bko", x, self.weight)
+        if self.bias is not None:
+            x = x + self.bias
+        return x
+
+
+class LinearBatchEnsemble(nn.Module):
+    """BatchEnsemble linear layer: x_i -> s_i * W(r_i * x_i) + bias_i."""
+
+    def __init__(
+        self,
+        in_features,
+        out_features,
+        k,
+        first_scaling_init="normal",
+        second_scaling_init="ones",
+        bias=True,
+    ):
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        self.r = nn.Parameter(torch.empty(k, in_features))
+        self.s = nn.Parameter(torch.empty(k, out_features))
+        self.bias = nn.Parameter(torch.empty(k, out_features)) if bias else None
+        self.in_features = in_features
+        self.out_features = out_features
+        self.k = k
+        self.first_scaling_init = first_scaling_init
+        self.second_scaling_init = second_scaling_init
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        init_rsqrt_uniform_(self.weight, self.in_features)
+        init_ensemble_scaling_(self.r, self.first_scaling_init)
+        init_ensemble_scaling_(self.s, self.second_scaling_init)
+        if self.bias is not None:
+            bias_init = torch.empty(
+                self.out_features,
+                dtype=self.weight.dtype,
+                device=self.weight.device,
+            )
+            init_rsqrt_uniform_(bias_init, self.in_features)
+            with torch.no_grad():
+                self.bias.copy_(bias_init)
+
+    def forward(self, x):
+        if x.dim() != 3 or x.shape[1] != self.k:
+            raise ValueError(
+                f"LinearBatchEnsemble expects (B, {self.k}, D), got {tuple(x.shape)}."
+            )
+        x = x * self.r
+        x = x @ self.weight.t()
+        x = x * self.s
+        if self.bias is not None:
+            x = x + self.bias
+        return x
+
+
+class TabMForecastMLP(nn.Module):
+    """Standard TabM-style forecast decoder for one shared representation."""
+
+    def __init__(
+        self,
+        in_features,
+        hidden_features,
+        out_features,
+        k,
+        dropout=0.0,
+        first_scaling_init="normal",
+    ):
+        super().__init__()
+        self.k = k
+        self.first = LinearBatchEnsemble(
+            in_features,
+            hidden_features,
+            k=k,
+            first_scaling_init=first_scaling_init,
+            second_scaling_init="ones",
+        )
+        self.activation = nn.GELU()
+        self.dropout = nn.Dropout(dropout)
+        self.output = LinearEnsemble(hidden_features, out_features, k=k)
+
+    def forward(self, x):
+        if x.dim() != 2:
+            raise ValueError(f"TabMForecastMLP expects (B, D), got {tuple(x.shape)}.")
+        x = x.unsqueeze(1).expand(-1, self.k, -1)
+        x = self.first(x)
+        x = self.activation(x)
+        x = self.dropout(x)
+        return self.output(x)
+
+
 class FlattenOrthogonalAdapter(nn.Module):
     """
     Builds compact expert tokens with a flatten-first prediction-head bias.
@@ -162,9 +279,9 @@ class AttentionBlock(nn.Module):
 class CrossAttentionForecastHead(nn.Module):
     """TabM-style direct forecast head over compact expert tokens.
 
-    The attention stack produces one shared forecast representation. The final
-    MLP is evaluated as a parameter-shared ensemble by applying K trainable
-    elementwise scalings to that representation before the shared decoder.
+    The attention stack produces one shared forecast representation. The
+    decoder follows the standard TabM pattern:
+        EnsembleView -> LinearBatchEnsemble -> activation -> LinearEnsemble.
     """
 
     def __init__(
@@ -177,7 +294,7 @@ class CrossAttentionForecastHead(nn.Module):
         query_tokens=1,
         dropout=0.0,
         ensemble_size=4,
-        ensemble_scaling_init="near-ones",
+        ensemble_scaling_init="normal",
     ):
         super().__init__()
         if d_model % n_heads != 0:
@@ -195,9 +312,6 @@ class CrossAttentionForecastHead(nn.Module):
             torch.zeros(len(self.expert_names), 1, d_model)
         )
         self.query = nn.Parameter(torch.randn(1, query_tokens, d_model) * 0.02)
-        self.ensemble_scaling = nn.Parameter(
-            torch.empty(ensemble_size, query_tokens * d_model)
-        )
         self.blocks = nn.ModuleList(
             [
                 AttentionBlock(
@@ -209,13 +323,14 @@ class CrossAttentionForecastHead(nn.Module):
             ]
         )
         self.output_norm = nn.LayerNorm(d_model)
-        self.forecast_head = nn.Sequential(
-            nn.Linear(query_tokens * d_model, d_model * 2),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_model * 2, pred_len),
+        self.forecast_head = TabMForecastMLP(
+            in_features=query_tokens * d_model,
+            hidden_features=d_model * 2,
+            out_features=pred_len,
+            k=ensemble_size,
+            dropout=dropout,
+            first_scaling_init=ensemble_scaling_init,
         )
-        init_ensemble_scaling_(self.ensemble_scaling, ensemble_scaling_init)
 
     def forward(self, tokens_by_expert):
         context_parts = []
@@ -231,10 +346,7 @@ class CrossAttentionForecastHead(nn.Module):
             attention_weights.append(weights)
 
         forecast_features = self.output_norm(query).flatten(start_dim=1)
-        ensemble_features = (
-            forecast_features.unsqueeze(1) * self.ensemble_scaling.unsqueeze(0)
-        )
-        ensemble_forecast = self.forecast_head(ensemble_features)
+        ensemble_forecast = self.forecast_head(forecast_features)
         forecast = ensemble_forecast.mean(dim=1)
         return forecast, {
             "query_tokens": query,
@@ -289,7 +401,7 @@ class FlattenOrthogonalAttentionExpertHeadFusion(nn.Module):
         attention_layers=1,
         attention_query_tokens=1,
         ensemble_size=4,
-        ensemble_scaling_init="near-ones",
+        ensemble_scaling_init="normal",
         device="cuda",
     ):
         super().__init__()
