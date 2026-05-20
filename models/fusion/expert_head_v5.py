@@ -6,23 +6,15 @@ import torch.nn.functional as F
 
 from layers.revin import RevIN
 
-try:
-    from torch.nn.utils.parametrizations import orthogonal as orthogonal_param
-
-    HAS_ORTHOGONAL_PARAM = True
-except Exception:
-    HAS_ORTHOGONAL_PARAM = False
-
-
 def orthogonal_linear(in_features, out_features):
     """
-    Linear layer with a hard orthogonal parametrization when PyTorch supports it.
-    Falls back to orthogonal initialization while keeping the same interface.
+    Linear layer with orthogonal initialization.
+
+    This keeps the flatten-first adapter fast while giving each projection
+    branch an initially orthogonal basis. The weights are not constrained to
+    remain orthogonal during training.
     """
     layer = nn.Linear(in_features, out_features, bias=False)
-    if HAS_ORTHOGONAL_PARAM:
-        return orthogonal_param(layer)
-
     nn.init.orthogonal_(layer.weight)
     return layer
 
@@ -485,7 +477,10 @@ class FlattenOrthogonalAttentionExpertHeadFusion(nn.Module):
 
         target = self._get_target(batch)
         main_loss = self.loss_func(output, target)
-        orth_loss = self.orthogonal_loss(tokens_by_expert)
+        if self.orth_loss_weight > 0:
+            orth_loss = self.orthogonal_loss(tokens_by_expert)
+        else:
+            orth_loss = output.new_tensor(0.0)
         loss = main_loss + self.orth_loss_weight * orth_loss
 
         info.update(
