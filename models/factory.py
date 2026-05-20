@@ -9,6 +9,7 @@ from .fusion.expert_head_v2 import AlignedExpertHeadFusion
 from .fusion.expert_head_v3 import CompressedExpertHeadFusion
 from .fusion.expert_head_v4 import OrthogonalAttentionExpertHeadFusion
 from .fusion.expert_head_v5 import FlattenOrthogonalAttentionExpertHeadFusion
+from .fusion.expert_head_v6 import ExpertSpecificAttentionFusion
 from .fusion.legacy import FusionModel as FusionLegacy
 from .fusion.tensor_v3 import FusionModelV3 as FusionTensorV3
 from .fusion.v2 import FusionModel as FusionV2
@@ -25,6 +26,7 @@ FUSION_REGISTRY = {
     "expert_head_v3": CompressedExpertHeadFusion,
     "expert_head_v4": OrthogonalAttentionExpertHeadFusion,
     "expert_head_v5": FlattenOrthogonalAttentionExpertHeadFusion,
+    "expert_head_v6": ExpertSpecificAttentionFusion,
     "legacy": FusionLegacy,
     "v2": FusionV2,
     "v3": FusionModelV3,
@@ -42,6 +44,7 @@ HIDDEN_ONLY_FUSION_VERSIONS = {
     "expert_head_v3",
     "expert_head_v4",
     "expert_head_v5",
+    "expert_head_v6",
     "v4",
     "v5",
     "tensor_v3",
