@@ -11,6 +11,7 @@ from .fusion.expert_head_v4 import OrthogonalAttentionExpertHeadFusion
 from .fusion.expert_head_v5 import FlattenOrthogonalAttentionExpertHeadFusion
 from .fusion.expert_head_v6 import ExpertSpecificAttentionFusion
 from .fusion.expert_head_v7 import ConstrainedExpertHeadFusion
+from .fusion.expert_head_v8 import WeatherAwareExpertHeadFusion
 from .fusion.legacy import FusionModel as FusionLegacy
 from .fusion.tensor_v3 import FusionModelV3 as FusionTensorV3
 from .fusion.v2 import FusionModel as FusionV2
@@ -29,6 +30,7 @@ FUSION_REGISTRY = {
     "expert_head_v5": FlattenOrthogonalAttentionExpertHeadFusion,
     "expert_head_v6": ExpertSpecificAttentionFusion,
     "expert_head_v7": ConstrainedExpertHeadFusion,
+    "expert_head_v8": WeatherAwareExpertHeadFusion,
     "legacy": FusionLegacy,
     "v2": FusionV2,
     "v3": FusionModelV3,
@@ -48,6 +50,7 @@ HIDDEN_ONLY_FUSION_VERSIONS = {
     "expert_head_v5",
     "expert_head_v6",
     "expert_head_v7",
+    "expert_head_v8",
     "v4",
     "v5",
     "tensor_v3",
@@ -74,7 +77,10 @@ class FusionModelWithExperts(nn.Module):
     def forward(self, batch, flag="test", **kwargs):
         batch_tensor = {}
         for name, model in self.expert_models.items():
-            model.eval()
+            if flag == 'train':
+                model.train() 
+            else:
+                model.eval()
             with torch.no_grad():
                 batch_tensor[name] = model.forward_hidden(batch)
 
@@ -160,6 +166,7 @@ def build_fusion_model(args, base_models=None, device=None):
     gate_temperature = getattr(args, "fusion_gate_temperature", None)
     gate_reg_weight = getattr(args, "fusion_gate_reg_weight", None)
     base_loss_weight = getattr(args, "fusion_base_loss_weight", None)
+    weather_keys = parse_expert_names(getattr(args, "fusion_weather_keys", None))
 
     constructor_kwargs = {
         "models_dict": base_models,
@@ -187,6 +194,7 @@ def build_fusion_model(args, base_models=None, device=None):
         "gate_temperature": gate_temperature,
         "gate_reg_weight": gate_reg_weight,
         "base_loss_weight": base_loss_weight,
+        "weather_keys": weather_keys,
         "device": device,
     }
     constructor_kwargs = _filter_constructor_kwargs(model_cls, constructor_kwargs)

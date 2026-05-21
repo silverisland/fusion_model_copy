@@ -19,7 +19,7 @@ def main():
     parser.add_argument('--model', type=str, required=True, default='FusionModel',
                         help='model name, options: [FusionModel, DLinear, PatchTST, iTransformer, TimesNet]')
     parser.add_argument('--fusion_version', type=str, default='base',
-                        choices=['base', 'expert_head', 'multi_expert_head', 'expert_head_v2', 'expert_head_v3', 'expert_head_v4', 'expert_head_v5', 'expert_head_v6', 'expert_head_v7', 'legacy', 'v2', 'v3', 'v4', 'v5', 'tensor_v3'],
+                        choices=['base', 'expert_head', 'multi_expert_head', 'expert_head_v2', 'expert_head_v3', 'expert_head_v4', 'expert_head_v5', 'expert_head_v6', 'expert_head_v7', 'expert_head_v8', 'legacy', 'v2', 'v3', 'v4', 'v5', 'tensor_v3'],
                         help='fusion model version selected by models/factory.py')
     parser.add_argument('--fusion_expert_name', type=str, default='m1',
                         choices=['m1', 'm2', 'm3', 'm4'],
@@ -65,6 +65,8 @@ def main():
                         help='uniform-weight regularization for constrained prediction gate in expert_head_v7')
     parser.add_argument('--fusion_base_loss_weight', type=float, default=None,
                         help='base mean prediction loss weight for expert_head_v7')
+    parser.add_argument('--fusion_weather_keys', type=str, default=None,
+                        help="comma-separated future weather forecast keys for expert_head_v8, e.g. 'temp,ghi,cloud'")
     parser.add_argument('--target_key', type=str, default='observe_power_future',
                         help='target tensor key used by fusion models')
 
@@ -190,6 +192,7 @@ def main():
         if args.fusion_base_loss_weight is not None
         else 'default'
     )
+    fusion_weather_keys = args.fusion_weather_keys or 'default'
     setting = (
         f'{args.model_id}_{args.model}_{args.fusion_version}_{args.data}'
         f'_sl{args.seq_len}_pl{args.pred_len}_bs{args.batch_size}'
@@ -206,6 +209,7 @@ def main():
         f'_exdrop{fusion_expert_drop_prob}'
         f'_gtemp{fusion_gate_temperature}_greg{fusion_gate_reg_weight}'
         f'_baseloss{fusion_base_loss_weight}'
+        f'_weather{fusion_weather_keys}'
         f'_expert{fusion_expert_names}_{args.des}'
     )
 
