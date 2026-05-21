@@ -119,7 +119,7 @@ class LinearBatchEnsemble(nn.Module):
 
 
 class TabMForecastMLP(nn.Module):
-    """Standard TabM-style forecast decoder for one shared representation."""
+    """Standard TabM-style forecast decoder for K member representations."""
 
     def __init__(
         self,
@@ -144,9 +144,10 @@ class TabMForecastMLP(nn.Module):
         self.output = LinearEnsemble(hidden_features, out_features, k=k)
 
     def forward(self, x):
-        if x.dim() != 2:
-            raise ValueError(f"TabMForecastMLP expects (B, D), got {tuple(x.shape)}.")
-        x = x.unsqueeze(1).expand(-1, self.k, -1)
+        if x.dim() != 3 or x.shape[1] != self.k:
+            raise ValueError(
+                f"TabMForecastMLP expects (B, {self.k}, D), got {tuple(x.shape)}."
+            )
         x = self.first(x)
         x = self.activation(x)
         x = self.dropout(x)
@@ -279,9 +280,9 @@ class AttentionBlock(nn.Module):
 class CrossAttentionForecastHead(nn.Module):
     """TabM-style direct forecast head over compact expert tokens.
 
-    The attention stack produces one shared forecast representation. The
-    decoder follows the standard TabM pattern:
-        EnsembleView -> LinearBatchEnsemble -> activation -> LinearEnsemble.
+    Each query token is one TabM member. The attention stack preserves the
+    member dimension, then the decoder follows the standard TabM pattern:
+        LinearBatchEnsemble -> activation -> LinearEnsemble.
     """
 
     def __init__(
@@ -291,7 +292,7 @@ class CrossAttentionForecastHead(nn.Module):
         pred_len=192,
         n_heads=4,
         n_layers=1,
-        query_tokens=1,
+        query_tokens=None,
         dropout=0.0,
         ensemble_size=4,
         ensemble_scaling_init="normal",
@@ -303,6 +304,13 @@ class CrossAttentionForecastHead(nn.Module):
             )
         if ensemble_size < 1:
             raise ValueError(f"ensemble_size must be positive, got {ensemble_size}.")
+        if query_tokens is None:
+            query_tokens = ensemble_size
+        if query_tokens != ensemble_size:
+            raise ValueError(
+                "For expert_head_v5 scheme B, query_tokens must equal ensemble_size: "
+                f"got query_tokens={query_tokens}, ensemble_size={ensemble_size}."
+            )
 
         self.expert_names = list(expert_names)
         self.d_model = d_model
@@ -324,7 +332,7 @@ class CrossAttentionForecastHead(nn.Module):
         )
         self.output_norm = nn.LayerNorm(d_model)
         self.forecast_head = TabMForecastMLP(
-            in_features=query_tokens * d_model,
+            in_features=d_model,
             hidden_features=d_model * 2,
             out_features=pred_len,
             k=ensemble_size,
@@ -345,7 +353,7 @@ class CrossAttentionForecastHead(nn.Module):
             query, weights = block(query, context)
             attention_weights.append(weights)
 
-        forecast_features = self.output_norm(query).flatten(start_dim=1)
+        forecast_features = self.output_norm(query)
         ensemble_forecast = self.forecast_head(forecast_features)
         forecast = ensemble_forecast.mean(dim=1)
         return forecast, {
@@ -399,7 +407,7 @@ class FlattenOrthogonalAttentionExpertHeadFusion(nn.Module):
         orth_loss_weight=1e-4,
         attention_heads=4,
         attention_layers=1,
-        attention_query_tokens=1,
+        attention_query_tokens=None,
         ensemble_size=4,
         ensemble_scaling_init="normal",
         device="cuda",
@@ -415,6 +423,14 @@ class FlattenOrthogonalAttentionExpertHeadFusion(nn.Module):
         self.orth_loss_weight = orth_loss_weight
         self.attention_heads = attention_heads
         self.attention_layers = attention_layers
+        if attention_query_tokens is None:
+            attention_query_tokens = ensemble_size
+        if attention_query_tokens != ensemble_size:
+            raise ValueError(
+                "For expert_head_v5 scheme B, attention_query_tokens must equal "
+                f"ensemble_size: got {attention_query_tokens} and {ensemble_size}."
+            )
+
         self.attention_query_tokens = attention_query_tokens
         self.ensemble_size = ensemble_size
         self.ensemble_scaling_init = ensemble_scaling_init
