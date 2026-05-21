@@ -220,6 +220,7 @@ class CrossAttentionForecastHead(nn.Module):
         query_tokens=None,
         dropout=0.0,
         ensemble_size=4,
+        expert_drop_prob=0.0,
     ):
         super().__init__()
         if d_model % n_heads != 0:
@@ -235,11 +236,16 @@ class CrossAttentionForecastHead(nn.Module):
                 "For expert_head_v5 scheme B, query_tokens must equal ensemble_size: "
                 f"got query_tokens={query_tokens}, ensemble_size={ensemble_size}."
             )
+        if not 0.0 <= expert_drop_prob < 1.0:
+            raise ValueError(
+                f"expert_drop_prob must be in [0, 1), got {expert_drop_prob}."
+            )
 
         self.expert_names = list(expert_names)
         self.d_model = d_model
         self.query_tokens = query_tokens
         self.ensemble_size = ensemble_size
+        self.expert_drop_prob = expert_drop_prob
         self.expert_embedding = nn.Parameter(
             torch.zeros(len(self.expert_names), 1, d_model)
         )
@@ -263,10 +269,41 @@ class CrossAttentionForecastHead(nn.Module):
             dropout=dropout,
         )
 
+    def _expert_keep_mask(self, batch_size, device):
+        if not self.training or self.expert_drop_prob <= 0.0:
+            return None
+
+        keep = torch.rand(
+            batch_size,
+            len(self.expert_names),
+            device=device,
+        ) >= self.expert_drop_prob
+
+        all_dropped = ~keep.any(dim=1)
+        if all_dropped.any():
+            fallback = torch.randint(
+                0,
+                len(self.expert_names),
+                (int(all_dropped.sum().item()),),
+                device=device,
+            )
+            keep[all_dropped] = False
+            keep[all_dropped, fallback] = True
+        return keep
+
     def forward(self, tokens_by_expert):
+        first_tokens = tokens_by_expert[self.expert_names[0]]
+        keep_mask = self._expert_keep_mask(
+            batch_size=first_tokens.shape[0],
+            device=first_tokens.device,
+        )
         context_parts = []
         for index, name in enumerate(self.expert_names):
-            context_parts.append(tokens_by_expert[name] + self.expert_embedding[index])
+            tokens = tokens_by_expert[name] + self.expert_embedding[index]
+            if keep_mask is not None:
+                mask = keep_mask[:, index].to(tokens.dtype).view(-1, 1, 1)
+                tokens = tokens * mask / (1.0 - self.expert_drop_prob)
+            context_parts.append(tokens)
         context = torch.cat(context_parts, dim=1)
 
         batch_size = context.shape[0]
@@ -285,6 +322,7 @@ class CrossAttentionForecastHead(nn.Module):
             "forecast_features": forecast_features,
             "ensemble_forecast": ensemble_forecast,
             "attention_weights": attention_weights,
+            "expert_keep_mask": keep_mask,
         }
 
 
@@ -327,6 +365,7 @@ class FlattenOrthogonalAttentionExpertHeadFusion(nn.Module):
         attention_query_tokens=None,
         ensemble_size=4,
         ensemble_scaling_init="normal",
+        expert_drop_prob=0.0,
         device="cuda",
     ):
         super().__init__()
@@ -351,6 +390,7 @@ class FlattenOrthogonalAttentionExpertHeadFusion(nn.Module):
         self.attention_query_tokens = attention_query_tokens
         self.ensemble_size = ensemble_size
         self.ensemble_scaling_init = ensemble_scaling_init
+        self.expert_drop_prob = expert_drop_prob
         self.expert_names = self._resolve_expert_names(models_dict, expert_names)
 
         self._validate_loss_type(loss_type)
@@ -377,6 +417,7 @@ class FlattenOrthogonalAttentionExpertHeadFusion(nn.Module):
             query_tokens=attention_query_tokens,
             dropout=dropout,
             ensemble_size=ensemble_size,
+            expert_drop_prob=expert_drop_prob,
         )
 
         self.to(device)

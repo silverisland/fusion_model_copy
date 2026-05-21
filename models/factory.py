@@ -153,6 +153,7 @@ def build_fusion_model(args, base_models=None, device=None):
     attention_query_tokens = getattr(args, "fusion_attention_query_tokens", None)
     ensemble_size = getattr(args, "fusion_ensemble_size", None)
     ensemble_scaling_init = getattr(args, "fusion_ensemble_scaling_init", None)
+    expert_drop_prob = getattr(args, "fusion_expert_drop_prob", None)
 
     constructor_kwargs = {
         "models_dict": base_models,
@@ -176,6 +177,7 @@ def build_fusion_model(args, base_models=None, device=None):
         "attention_query_tokens": attention_query_tokens,
         "ensemble_size": ensemble_size,
         "ensemble_scaling_init": ensemble_scaling_init,
+        "expert_drop_prob": expert_drop_prob,
         "device": device,
     }
     constructor_kwargs = _filter_constructor_kwargs(model_cls, constructor_kwargs)

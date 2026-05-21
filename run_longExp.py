@@ -57,6 +57,8 @@ def main():
     parser.add_argument('--fusion_ensemble_scaling_init', type=str, default=None,
                         choices=['ones', 'near-ones', 'normal', 'random-signs'],
                         help='initialization for expert_head_v5 ensemble scaling')
+    parser.add_argument('--fusion_expert_drop_prob', type=float, default=None,
+                        help='training-only expert-level dropout probability for expert_head_v5')
     parser.add_argument('--target_key', type=str, default='observe_power_future',
                         help='target tensor key used by fusion models')
 
@@ -162,6 +164,11 @@ def main():
         else 'default'
     )
     fusion_ensemble_scaling_init = args.fusion_ensemble_scaling_init or 'default'
+    fusion_expert_drop_prob = (
+        args.fusion_expert_drop_prob
+        if args.fusion_expert_drop_prob is not None
+        else 'default'
+    )
     setting = (
         f'{args.model_id}_{args.model}_{args.fusion_version}_{args.data}'
         f'_sl{args.seq_len}_pl{args.pred_len}_bs{args.batch_size}'
@@ -175,6 +182,7 @@ def main():
         f'_orth{fusion_orth}_attn{fusion_attention_heads}x{fusion_attention_layers}'
         f'_query{fusion_attention_query_tokens}'
         f'_ens{fusion_ensemble_size}_ensinit{fusion_ensemble_scaling_init}'
+        f'_exdrop{fusion_expert_drop_prob}'
         f'_expert{fusion_expert_names}_{args.des}'
     )
 
