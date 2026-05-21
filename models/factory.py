@@ -10,6 +10,7 @@ from .fusion.expert_head_v3 import CompressedExpertHeadFusion
 from .fusion.expert_head_v4 import OrthogonalAttentionExpertHeadFusion
 from .fusion.expert_head_v5 import FlattenOrthogonalAttentionExpertHeadFusion
 from .fusion.expert_head_v6 import ExpertSpecificAttentionFusion
+from .fusion.expert_head_v7 import ConstrainedExpertHeadFusion
 from .fusion.legacy import FusionModel as FusionLegacy
 from .fusion.tensor_v3 import FusionModelV3 as FusionTensorV3
 from .fusion.v2 import FusionModel as FusionV2
@@ -27,6 +28,7 @@ FUSION_REGISTRY = {
     "expert_head_v4": OrthogonalAttentionExpertHeadFusion,
     "expert_head_v5": FlattenOrthogonalAttentionExpertHeadFusion,
     "expert_head_v6": ExpertSpecificAttentionFusion,
+    "expert_head_v7": ConstrainedExpertHeadFusion,
     "legacy": FusionLegacy,
     "v2": FusionV2,
     "v3": FusionModelV3,
@@ -45,6 +47,7 @@ HIDDEN_ONLY_FUSION_VERSIONS = {
     "expert_head_v4",
     "expert_head_v5",
     "expert_head_v6",
+    "expert_head_v7",
     "v4",
     "v5",
     "tensor_v3",
@@ -154,6 +157,8 @@ def build_fusion_model(args, base_models=None, device=None):
     ensemble_size = getattr(args, "fusion_ensemble_size", None)
     ensemble_scaling_init = getattr(args, "fusion_ensemble_scaling_init", None)
     expert_drop_prob = getattr(args, "fusion_expert_drop_prob", None)
+    gate_temperature = getattr(args, "fusion_gate_temperature", None)
+    gate_reg_weight = getattr(args, "fusion_gate_reg_weight", None)
 
     constructor_kwargs = {
         "models_dict": base_models,
@@ -178,6 +183,8 @@ def build_fusion_model(args, base_models=None, device=None):
         "ensemble_size": ensemble_size,
         "ensemble_scaling_init": ensemble_scaling_init,
         "expert_drop_prob": expert_drop_prob,
+        "gate_temperature": gate_temperature,
+        "gate_reg_weight": gate_reg_weight,
         "device": device,
     }
     constructor_kwargs = _filter_constructor_kwargs(model_cls, constructor_kwargs)
