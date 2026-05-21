@@ -159,6 +159,7 @@ def build_fusion_model(args, base_models=None, device=None):
     expert_drop_prob = getattr(args, "fusion_expert_drop_prob", None)
     gate_temperature = getattr(args, "fusion_gate_temperature", None)
     gate_reg_weight = getattr(args, "fusion_gate_reg_weight", None)
+    base_loss_weight = getattr(args, "fusion_base_loss_weight", None)
 
     constructor_kwargs = {
         "models_dict": base_models,
@@ -185,6 +186,7 @@ def build_fusion_model(args, base_models=None, device=None):
         "expert_drop_prob": expert_drop_prob,
         "gate_temperature": gate_temperature,
         "gate_reg_weight": gate_reg_weight,
+        "base_loss_weight": base_loss_weight,
         "device": device,
     }
     constructor_kwargs = _filter_constructor_kwargs(model_cls, constructor_kwargs)

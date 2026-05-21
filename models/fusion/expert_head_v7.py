@@ -66,6 +66,7 @@ class ConstrainedExpertHeadFusion(nn.Module):
         expert_names=None,
         target_key="observe_power_future",
         loss_type="mse",
+        base_loss_weight=1.0,
         aux_loss_weight=0.5,
         gate_reg_weight=0.1,
         gate_temperature=5.0,
@@ -79,6 +80,7 @@ class ConstrainedExpertHeadFusion(nn.Module):
         self.n_features = n_features
         self.target_key = target_key
         self.loss_type = loss_type
+        self.base_loss_weight = base_loss_weight
         self.aux_loss_weight = aux_loss_weight
         self.gate_reg_weight = gate_reg_weight
         self.gate_temperature = gate_temperature
@@ -86,6 +88,10 @@ class ConstrainedExpertHeadFusion(nn.Module):
         self.expert_names = self._resolve_expert_names(models_dict, expert_names)
 
         self._validate_loss_type(loss_type)
+        if base_loss_weight < 0:
+            raise ValueError(
+                f"base_loss_weight must be non-negative, got {base_loss_weight}."
+            )
         if gate_temperature <= 0:
             raise ValueError(f"gate_temperature must be positive, got {gate_temperature}.")
         if gate_reg_weight < 0:
@@ -309,6 +315,7 @@ class ConstrainedExpertHeadFusion(nn.Module):
         gate_reg_loss = self._uniform_weight_penalty(gate_weight)
         loss = (
             main_loss
+            + self.base_loss_weight * base_loss
             + self.aux_loss_weight * aux_loss
             + self.gate_reg_weight * gate_reg_loss
         )
@@ -317,6 +324,7 @@ class ConstrainedExpertHeadFusion(nn.Module):
             {
                 "main_loss": main_loss.detach(),
                 "base_loss": base_loss.detach(),
+                "base_loss_weight": output.new_tensor(self.base_loss_weight),
                 "aux_loss": aux_loss.detach(),
                 "gate_reg_loss": gate_reg_loss.detach(),
                 "total_loss": loss.detach(),

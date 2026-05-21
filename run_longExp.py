@@ -63,6 +63,8 @@ def main():
                         help='softmax temperature for constrained prediction gate in expert_head_v7')
     parser.add_argument('--fusion_gate_reg_weight', type=float, default=None,
                         help='uniform-weight regularization for constrained prediction gate in expert_head_v7')
+    parser.add_argument('--fusion_base_loss_weight', type=float, default=None,
+                        help='base mean prediction loss weight for expert_head_v7')
     parser.add_argument('--target_key', type=str, default='observe_power_future',
                         help='target tensor key used by fusion models')
 
@@ -183,6 +185,11 @@ def main():
         if args.fusion_gate_reg_weight is not None
         else 'default'
     )
+    fusion_base_loss_weight = (
+        args.fusion_base_loss_weight
+        if args.fusion_base_loss_weight is not None
+        else 'default'
+    )
     setting = (
         f'{args.model_id}_{args.model}_{args.fusion_version}_{args.data}'
         f'_sl{args.seq_len}_pl{args.pred_len}_bs{args.batch_size}'
@@ -198,6 +205,7 @@ def main():
         f'_ens{fusion_ensemble_size}_ensinit{fusion_ensemble_scaling_init}'
         f'_exdrop{fusion_expert_drop_prob}'
         f'_gtemp{fusion_gate_temperature}_greg{fusion_gate_reg_weight}'
+        f'_baseloss{fusion_base_loss_weight}'
         f'_expert{fusion_expert_names}_{args.des}'
     )
 
