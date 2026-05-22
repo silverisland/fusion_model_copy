@@ -75,8 +75,63 @@ class Exp_Main(Exp_Basic):
         data_set, data_loader = data_provider(self.args, df, flag)
         return data_set, data_loader
 
+    def _unwrap_model(self):
+        return self.model.module if hasattr(self.model, "module") else self.model
+
+    def _trainable_parameters(self):
+        return [p for p in self.model.parameters() if p.requires_grad]
+
+    def _trainable_param_groups(self):
+        model = self._unwrap_model()
+        expert_lr_scale = getattr(self.args, "fusion_expert_lr_scale", 1.0)
+        if not hasattr(model, "expert_models") or not hasattr(model, "fusion_model"):
+            return [{"params": self._trainable_parameters()}]
+
+        fusion_params = [
+            p for p in model.fusion_model.parameters()
+            if p.requires_grad
+        ]
+        expert_params = [
+            p for p in model.expert_models.parameters()
+            if p.requires_grad
+        ]
+
+        param_groups = []
+        if fusion_params:
+            param_groups.append({
+                "params": fusion_params,
+                "lr": self.args.learning_rate,
+            })
+        if expert_params:
+            param_groups.append({
+                "params": expert_params,
+                "lr": self.args.learning_rate * expert_lr_scale,
+            })
+        return param_groups
+
+    def _muon_param_groups(self):
+        param_groups = []
+        for group in self._trainable_param_groups():
+            params = group["params"]
+            lr = group.get("lr", self.args.learning_rate)
+            muon_params = [p for p in params if p.ndim >= 2]
+            adamw_params = [p for p in params if p.ndim < 2]
+            if muon_params:
+                param_groups.append({
+                    "params": muon_params,
+                    "lr": lr,
+                    "use_muon": True,
+                })
+            if adamw_params:
+                param_groups.append({
+                    "params": adamw_params,
+                    "lr": lr,
+                    "use_muon": False,
+                })
+        return param_groups
+
     def _select_optimizer(self):
-        trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+        trainable_param_groups = self._trainable_param_groups()
         optimizer_name = self.args.optimizer.lower()
         optimizer_kwargs = {
             "lr": self.args.learning_rate,
@@ -84,19 +139,12 @@ class Exp_Main(Exp_Basic):
         }
 
         if optimizer_name == "adam":
-            return optim.Adam(trainable_params, **optimizer_kwargs)
+            return optim.Adam(trainable_param_groups, **optimizer_kwargs)
         if optimizer_name == "adamw":
-            return optim.AdamW(trainable_params, **optimizer_kwargs)
+            return optim.AdamW(trainable_param_groups, **optimizer_kwargs)
         if optimizer_name in {"muon", "moun"}:
-            muon_params = [p for p in trainable_params if p.ndim >= 2]
-            adamw_params = [p for p in trainable_params if p.ndim < 2]
-            param_groups = []
-            if muon_params:
-                param_groups.append({"params": muon_params, "use_muon": True})
-            if adamw_params:
-                param_groups.append({"params": adamw_params, "use_muon": False})
             return Muon(
-                param_groups,
+                self._muon_param_groups(),
                 momentum=self.args.muon_momentum,
                 ns_steps=self.args.muon_ns_steps,
                 **optimizer_kwargs,
@@ -104,18 +152,20 @@ class Exp_Main(Exp_Basic):
 
         raise ValueError(f"Unknown optimizer={self.args.optimizer!r}.")
 
-    def _select_scheduler(self, optimizer, train_steps):
+    def _select_scheduler(self, optimizer, train_steps, train_epochs=None):
         lradj = str(self.args.lradj).lower()
         if lradj in {"none", "constant", "type1", "type2", "type3"}:
             return None
 
-        total_steps = max(1, train_steps * self.args.train_epochs)
+        if train_epochs is None:
+            train_epochs = self.args.train_epochs
+        total_steps = max(1, train_steps * train_epochs)
         if lradj == "onecyclelr":
             return optim.lr_scheduler.OneCycleLR(
                 optimizer=optimizer,
-                max_lr=self.args.learning_rate,
+                max_lr=[group["lr"] for group in optimizer.param_groups],
                 steps_per_epoch=train_steps,
-                epochs=self.args.train_epochs,
+                epochs=train_epochs,
                 pct_start=self.args.pct_start,
             )
 
@@ -136,6 +186,37 @@ class Exp_Main(Exp_Basic):
             f"Unknown lradj={self.args.lradj!r}. "
             "Valid values: none, constant, type1, type2, type3, OneCycleLR, cosine."
         )
+
+    def _maybe_unfreeze_experts(self, epoch, train_steps):
+        unfreeze_epoch = getattr(self.args, "fusion_unfreeze_epoch", -1)
+        if unfreeze_epoch is None or unfreeze_epoch < 0 or epoch != unfreeze_epoch:
+            return None, None
+
+        model = self._unwrap_model()
+        if not hasattr(model, "set_experts_trainable"):
+            return None, None
+
+        model.set_experts_trainable(True)
+        remaining_epochs = max(1, self.args.train_epochs - epoch)
+        model_optim = self._select_optimizer()
+        scheduler = self._select_scheduler(
+            model_optim,
+            train_steps,
+            train_epochs=remaining_epochs,
+        )
+        expert_lr = self.args.learning_rate * getattr(
+            self.args,
+            "fusion_expert_lr_scale",
+            1.0,
+        )
+        print(
+            "Unfroze expert models at epoch {}. Fusion lr: {:.6g}, expert lr: {:.6g}".format(
+                epoch + 1,
+                self.args.learning_rate,
+                expert_lr,
+            )
+        )
+        return model_optim, scheduler
 
     def vali(self, vali_data, vali_loader):
         total_loss = []
@@ -168,6 +249,14 @@ class Exp_Main(Exp_Basic):
         lradj = str(self.args.lradj).lower()
 
         for epoch in range(self.args.train_epochs):
+            new_optim, new_scheduler = self._maybe_unfreeze_experts(
+                epoch,
+                train_steps,
+            )
+            if new_optim is not None:
+                model_optim = new_optim
+                scheduler = new_scheduler
+
             iter_count = 0
             train_loss = []
 

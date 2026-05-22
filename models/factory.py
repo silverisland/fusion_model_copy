@@ -67,11 +67,18 @@ class FusionModelWithExperts(nn.Module):
         super().__init__()
         self.expert_models = nn.ModuleDict(expert_models)
         self.fusion_model = fusion_model
+        self.experts_frozen = None
 
-        if freeze_experts:
-            for model in self.expert_models.values():
-                for param in model.parameters():
-                    param.requires_grad = False
+        self.set_experts_trainable(not freeze_experts)
+
+    def set_experts_trainable(self, trainable):
+        self.experts_frozen = not trainable
+        for model in self.expert_models.values():
+            for param in model.parameters():
+                param.requires_grad = trainable
+            if trainable:
+                model.train()
+            else:
                 model.eval()
 
     def forward(self, batch, flag="test", **kwargs):
@@ -81,7 +88,11 @@ class FusionModelWithExperts(nn.Module):
                 model.train() 
             else:
                 model.eval()
-            with torch.no_grad():
+
+            if self.experts_frozen:
+                with torch.no_grad():
+                    batch_tensor[name] = model.forward_hidden(batch)
+            else:
                 batch_tensor[name] = model.forward_hidden(batch)
 
         return self.fusion_model(batch_tensor, batch, flag=flag, **kwargs)

@@ -75,6 +75,10 @@ def main():
                         help='focus-window loss weight for expert_head_v8')
     parser.add_argument('--fusion_full_loss_weight', type=float, default=1.0,
                         help='full-sequence loss weight used when expert_head_v8 focus loss is enabled')
+    parser.add_argument('--fusion_unfreeze_epoch', type=int, default=-1,
+                        help='freeze expert models for this many epochs, then unfreeze; -1 disables')
+    parser.add_argument('--fusion_expert_lr_scale', type=float, default=0.1,
+                        help='expert-model learning-rate scale after unfreezing')
     parser.add_argument('--target_key', type=str, default='observe_power_future',
                         help='target tensor key used by fusion models')
 
@@ -206,6 +210,10 @@ def main():
         f'w{args.fusion_focus_loss_weight}'
         f'full{args.fusion_full_loss_weight}'
     )
+    fusion_unfreeze = (
+        f'{args.fusion_unfreeze_epoch}'
+        f'x{args.fusion_expert_lr_scale}'
+    )
     setting = (
         f'{args.model_id}_{args.model}_{args.fusion_version}_{args.data}'
         f'_sl{args.seq_len}_pl{args.pred_len}_bs{args.batch_size}'
@@ -224,6 +232,7 @@ def main():
         f'_baseloss{fusion_base_loss_weight}'
         f'_weather{fusion_weather_keys}'
         f'_focus{fusion_focus_loss}'
+        f'_unfreeze{fusion_unfreeze}'
         f'_expert{fusion_expert_names}_{args.des}'
     )
 
