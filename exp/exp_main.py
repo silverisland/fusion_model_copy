@@ -196,6 +196,20 @@ class Exp_Main(Exp_Basic):
         if not hasattr(model, "set_experts_trainable"):
             return None, None
 
+        expert_lr = self.args.learning_rate * getattr(
+            self.args,
+            "fusion_expert_lr_scale",
+            1.0,
+        )
+        print(
+            "\n[staged-unfreeze] Epoch {} begins: unfreezing expert models. "
+            "Frozen epochs: {}, fusion lr: {:.6g}, expert lr: {:.6g}".format(
+                epoch + 1,
+                unfreeze_epoch,
+                self.args.learning_rate,
+                expert_lr,
+            )
+        )
         model.set_experts_trainable(True)
         remaining_epochs = max(1, self.args.train_epochs - epoch)
         model_optim = self._select_optimizer()
@@ -204,16 +218,13 @@ class Exp_Main(Exp_Basic):
             train_steps,
             train_epochs=remaining_epochs,
         )
-        expert_lr = self.args.learning_rate * getattr(
-            self.args,
-            "fusion_expert_lr_scale",
-            1.0,
+        trainable_params = sum(
+            p.numel() for p in self.model.parameters() if p.requires_grad
         )
         print(
-            "Unfroze expert models at epoch {}. Fusion lr: {:.6g}, expert lr: {:.6g}".format(
-                epoch + 1,
-                self.args.learning_rate,
-                expert_lr,
+            "[staged-unfreeze] Optimizer and scheduler rebuilt. "
+            "Trainable parameters: {:,}\n".format(
+                trainable_params,
             )
         )
         return model_optim, scheduler
