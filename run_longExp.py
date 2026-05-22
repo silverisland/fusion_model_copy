@@ -67,6 +67,14 @@ def main():
                         help='base mean prediction loss weight for expert_head_v7')
     parser.add_argument('--fusion_weather_keys', type=str, default=None,
                         help="comma-separated future weather forecast keys for expert_head_v8, e.g. 'temp,ghi,cloud'")
+    parser.add_argument('--fusion_focus_loss_start', type=int, default=59,
+                        help='0-based inclusive start index for expert_head_v8 focus loss')
+    parser.add_argument('--fusion_focus_loss_end', type=int, default=152,
+                        help='0-based exclusive end index for expert_head_v8 focus loss')
+    parser.add_argument('--fusion_focus_loss_weight', type=float, default=0.0,
+                        help='focus-window loss weight for expert_head_v8')
+    parser.add_argument('--fusion_full_loss_weight', type=float, default=1.0,
+                        help='full-sequence loss weight used when expert_head_v8 focus loss is enabled')
     parser.add_argument('--target_key', type=str, default='observe_power_future',
                         help='target tensor key used by fusion models')
 
@@ -193,6 +201,11 @@ def main():
         else 'default'
     )
     fusion_weather_keys = args.fusion_weather_keys or 'default'
+    fusion_focus_loss = (
+        f'{args.fusion_focus_loss_start}-{args.fusion_focus_loss_end}'
+        f'w{args.fusion_focus_loss_weight}'
+        f'full{args.fusion_full_loss_weight}'
+    )
     setting = (
         f'{args.model_id}_{args.model}_{args.fusion_version}_{args.data}'
         f'_sl{args.seq_len}_pl{args.pred_len}_bs{args.batch_size}'
@@ -210,6 +223,7 @@ def main():
         f'_gtemp{fusion_gate_temperature}_greg{fusion_gate_reg_weight}'
         f'_baseloss{fusion_base_loss_weight}'
         f'_weather{fusion_weather_keys}'
+        f'_focus{fusion_focus_loss}'
         f'_expert{fusion_expert_names}_{args.des}'
     )
 

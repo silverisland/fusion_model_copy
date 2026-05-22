@@ -437,6 +437,10 @@ class WeatherAwareExpertHeadFusion(nn.Module):
         ensemble_scaling_init="normal",
         expert_drop_prob=0.0,
         weather_keys=None,
+        focus_loss_start=59,
+        focus_loss_end=152,
+        focus_loss_weight=0.0,
+        full_loss_weight=1.0,
         device="cuda",
     ):
         super().__init__()
@@ -464,8 +468,13 @@ class WeatherAwareExpertHeadFusion(nn.Module):
         self.expert_drop_prob = expert_drop_prob
         self.expert_names = self._resolve_expert_names(models_dict, expert_names)
         self.weather_keys = list(weather_keys or [])
+        self.focus_loss_start = focus_loss_start
+        self.focus_loss_end = focus_loss_end
+        self.focus_loss_weight = focus_loss_weight
+        self.full_loss_weight = full_loss_weight
 
         self._validate_loss_type(loss_type)
+        self._validate_focus_loss_config()
         resolved_dims = self._resolve_expert_dims(expert_dims)
         resolved_input_tokens = self._resolve_input_tokens()
 
@@ -498,13 +507,37 @@ class WeatherAwareExpertHeadFusion(nn.Module):
 
     DEFAULT_EXPERT_DIMS = {"m1": 128, "m2": 512, "m3": 384, "m4": 256}
     DEFAULT_INPUT_TOKENS = {"m1": 9, "m2": 2, "m3": 162, "m4": 45}
-    SUPPORTED_LOSSES = {"mse", "mae", "huber"}
+    SUPPORTED_LOSSES = {"mse", "mae", "huber", "rmse"}
 
     @classmethod
     def _validate_loss_type(cls, loss_type):
         if loss_type not in cls.SUPPORTED_LOSSES:
             valid = ", ".join(sorted(cls.SUPPORTED_LOSSES))
             raise ValueError(f"Unknown loss_type={loss_type!r}. Valid: {valid}.")
+
+    def _validate_focus_loss_config(self):
+        if self.full_loss_weight < 0:
+            raise ValueError(
+                f"full_loss_weight must be non-negative, got {self.full_loss_weight}."
+            )
+        if self.focus_loss_weight < 0:
+            raise ValueError(
+                f"focus_loss_weight must be non-negative, got {self.focus_loss_weight}."
+            )
+        if self.focus_loss_weight <= 0:
+            return
+
+        if self.focus_loss_start is None or self.focus_loss_end is None:
+            raise ValueError(
+                "focus_loss_start and focus_loss_end are required when "
+                "focus_loss_weight > 0."
+            )
+        if not 0 <= self.focus_loss_start < self.focus_loss_end <= self.pred_len:
+            raise ValueError(
+                "Focus loss window must satisfy "
+                f"0 <= start < end <= pred_len, got start={self.focus_loss_start}, "
+                f"end={self.focus_loss_end}, pred_len={self.pred_len}."
+            )
 
     def _resolve_expert_names(self, models_dict, expert_names):
         if expert_names is not None:
@@ -633,18 +666,46 @@ class WeatherAwareExpertHeadFusion(nn.Module):
     def loss_func(self, pred, target):
         if self.loss_type == "mse":
             return F.mse_loss(pred, target)
+        if self.loss_type == "rmse":
+            return torch.sqrt(F.mse_loss(pred, target) + 1e-8)
         if self.loss_type == "mae":
             return F.l1_loss(pred, target)
         if self.loss_type == "huber":
             return F.huber_loss(pred, target, delta=1.0)
         raise ValueError(f"Unknown loss_type={self.loss_type!r}")
 
+    def prediction_loss_components(self, pred, target):
+        full_loss = self.loss_func(pred, target)
+        if self.focus_loss_weight <= 0:
+            zero = full_loss.new_tensor(0.0)
+            return full_loss, full_loss, zero
+
+        focus_pred = pred[..., self.focus_loss_start : self.focus_loss_end]
+        focus_target = target[..., self.focus_loss_start : self.focus_loss_end]
+        focus_loss = self.loss_func(focus_pred, focus_target)
+        total_loss = (
+            self.full_loss_weight * full_loss
+            + self.focus_loss_weight * focus_loss
+        )
+        return total_loss, full_loss, focus_loss
+
     def ensemble_loss_func(self, pred, target):
-        losses = [
-            self.loss_func(pred[:, index], target)
-            for index in range(pred.shape[1])
-        ]
-        return torch.stack(losses).mean()
+        losses = []
+        full_losses = []
+        focus_losses = []
+        for index in range(pred.shape[1]):
+            total_loss, full_loss, focus_loss = self.prediction_loss_components(
+                pred[:, index],
+                target,
+            )
+            losses.append(total_loss)
+            full_losses.append(full_loss)
+            focus_losses.append(focus_loss)
+        return (
+            torch.stack(losses).mean(),
+            torch.stack(full_losses).mean(),
+            torch.stack(focus_losses).mean(),
+        )
 
     def _within_expert_token_loss(self, compact_tokens):
         if compact_tokens.shape[1] < 2:
@@ -731,7 +792,10 @@ class WeatherAwareExpertHeadFusion(nn.Module):
             return output.squeeze(1)
 
         target = self._get_target(batch)
-        main_loss = self.ensemble_loss_func(ensemble_output, target)
+        main_loss, full_loss, focus_loss = self.ensemble_loss_func(
+            ensemble_output,
+            target,
+        )
         if self.orth_loss_weight > 0:
             orth_loss = self.orthogonal_loss(tokens_by_expert)
         else:
@@ -741,8 +805,14 @@ class WeatherAwareExpertHeadFusion(nn.Module):
         info.update(
             {
                 "main_loss": main_loss.detach(),
+                "full_loss": full_loss.detach(),
+                "focus_loss": focus_loss.detach(),
                 "orth_loss": orth_loss.detach(),
                 "total_loss": loss.detach(),
+                "focus_loss_start": self.focus_loss_start,
+                "focus_loss_end": self.focus_loss_end,
+                "focus_loss_weight": self.focus_loss_weight,
+                "full_loss_weight": self.full_loss_weight,
             }
         )
 

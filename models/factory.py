@@ -167,6 +167,10 @@ def build_fusion_model(args, base_models=None, device=None):
     gate_reg_weight = getattr(args, "fusion_gate_reg_weight", None)
     base_loss_weight = getattr(args, "fusion_base_loss_weight", None)
     weather_keys = parse_expert_names(getattr(args, "fusion_weather_keys", None))
+    focus_loss_start = getattr(args, "fusion_focus_loss_start", None)
+    focus_loss_end = getattr(args, "fusion_focus_loss_end", None)
+    focus_loss_weight = getattr(args, "fusion_focus_loss_weight", None)
+    full_loss_weight = getattr(args, "fusion_full_loss_weight", None)
 
     constructor_kwargs = {
         "models_dict": base_models,
@@ -195,6 +199,10 @@ def build_fusion_model(args, base_models=None, device=None):
         "gate_reg_weight": gate_reg_weight,
         "base_loss_weight": base_loss_weight,
         "weather_keys": weather_keys,
+        "focus_loss_start": focus_loss_start,
+        "focus_loss_end": focus_loss_end,
+        "focus_loss_weight": focus_loss_weight,
+        "full_loss_weight": full_loss_weight,
         "device": device,
     }
     constructor_kwargs = _filter_constructor_kwargs(model_cls, constructor_kwargs)
