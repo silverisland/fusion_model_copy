@@ -88,7 +88,7 @@ class FlattenOrthogonalAdapter(nn.Module):
     Builds compact expert tokens with a flatten-first prediction-head bias.
 
     For each expert, the adapter creates K projection branches:
-        hidden -> channel projection -> flatten -> Linear -> one compact token
+        hidden -> flatten -> Linear -> one compact token
 
     Output shape:
         (B, token_count, d_model)
@@ -108,22 +108,11 @@ class FlattenOrthogonalAdapter(nn.Module):
         self.token_count = token_count
         self.d_model = d_model
 
-        self.branch_projectors = nn.ModuleList(
-            [
-                nn.Sequential(
-                    nn.LayerNorm(input_dim),
-                    orthogonal_linear(input_dim, d_model),
-                    nn.GELU(),
-                    nn.Dropout(dropout),
-                )
-                for _ in range(token_count)
-            ]
-        )
         self.branch_readouts = nn.ModuleList(
             [
                 nn.Sequential(
-                    nn.LayerNorm(input_tokens * d_model),
-                    orthogonal_linear(input_tokens * d_model, d_model),
+                    nn.LayerNorm(input_tokens * input_dim),
+                    orthogonal_linear(input_tokens * input_dim, d_model),
                     nn.GELU(),
                     nn.Dropout(dropout),
                 )
@@ -148,19 +137,18 @@ class FlattenOrthogonalAdapter(nn.Module):
             )
 
         compact_tokens = []
-        for projector, readout in zip(self.branch_projectors, self.branch_readouts):
-            projected = projector(tokens)
-            flattened = projected.flatten(start_dim=1)
+        flattened = tokens.flatten(start_dim=1)
+        for readout in self.branch_readouts:
             compact_tokens.append(readout(flattened))
         return torch.stack(compact_tokens, dim=1)
 
     def projection_weight_orthogonal_loss(self):
         if self.token_count < 2:
-            first_weight = self.branch_projectors[0][1].weight
+            first_weight = self.branch_readouts[0][1].weight
             return first_weight.new_tensor(0.0)
 
         losses = []
-        weights = [branch[1].weight for branch in self.branch_projectors]
+        weights = [branch[1].weight for branch in self.branch_readouts]
         for left, right in itertools.combinations(weights, 2):
             left_norm = F.normalize(left, dim=-1, eps=1e-6)
             right_norm = F.normalize(right, dim=-1, eps=1e-6)
