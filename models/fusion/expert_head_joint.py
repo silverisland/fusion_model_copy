@@ -274,6 +274,57 @@ class JointExpertPredictionHeads(nn.Module):
             return F.huber_loss(pred, target, delta=1.0)
         raise ValueError(f"Unknown loss_type={self.loss_type!r}")
 
+    def loss_func_per_sample(self, pred, target):
+        loss_dims = tuple(range(1, pred.ndim))
+        if self.loss_type == "mse":
+            return (pred - target).pow(2).mean(dim=loss_dims)
+        if self.loss_type == "rmse":
+            return torch.sqrt((pred - target).pow(2).mean(dim=loss_dims) + 1e-8)
+        if self.loss_type == "mae":
+            return (pred - target).abs().mean(dim=loss_dims)
+        if self.loss_type == "huber":
+            return F.huber_loss(pred, target, delta=1.0, reduction="none").mean(
+                dim=loss_dims
+            )
+        raise ValueError(f"Unknown loss_type={self.loss_type!r}")
+
+    def _get_expert_mask(self, batch, batch_size, device):
+        if batch is None or "expert_mask" not in batch:
+            return None
+
+        mask = batch["expert_mask"]
+        if not torch.is_tensor(mask):
+            mask = torch.as_tensor(mask, device=device)
+        else:
+            mask = mask.to(device=device)
+        mask = mask.float()
+
+        expert_count = len(self.expert_names)
+        if mask.dim() == 1:
+            if mask.shape[0] != expert_count:
+                raise ValueError(
+                    f"expert_mask length must be {expert_count}, got {mask.shape[0]}."
+                )
+            mask = mask.unsqueeze(0).expand(batch_size, -1)
+        elif mask.dim() == 2:
+            if tuple(mask.shape) != (batch_size, expert_count):
+                raise ValueError(
+                    f"expert_mask must be shaped {(batch_size, expert_count)}, "
+                    f"got {tuple(mask.shape)}."
+                )
+        else:
+            raise ValueError(
+                f"expert_mask must be shaped ({expert_count},) or "
+                f"({batch_size}, {expert_count}), got {tuple(mask.shape)}."
+            )
+
+        mask = (mask > 0).float()
+        all_masked = mask.sum(dim=1) == 0
+        if all_masked.any():
+            mask = mask.clone()
+            mask[all_masked] = 1.0
+        return mask
+
     def _set_revin_statistics(self, batch):
         if batch is None:
             raise ValueError("batch is required for RevIN normalization.")
@@ -319,12 +370,29 @@ class JointExpertPredictionHeads(nn.Module):
             preds.append(pred)
 
         pred_stack = torch.stack(preds, dim=1)
-        output = pred_stack.mean(dim=1)
+        expert_mask = self._get_expert_mask(
+            batch,
+            batch_size=pred_stack.shape[0],
+            device=pred_stack.device,
+        )
+        if expert_mask is None:
+            output = pred_stack.mean(dim=1)
+            normalized_mask = None
+        else:
+            normalized_mask = expert_mask / expert_mask.sum(
+                dim=1,
+                keepdim=True,
+            ).clamp_min(1.0)
+            output = (pred_stack * normalized_mask[:, :, None, None]).sum(dim=1)
+
         info = {
             "expert_names": self.expert_names,
             "pred_by_expert": pred_by_expert,
             "pred_stack": pred_stack,
         }
+        if expert_mask is not None:
+            info["expert_mask"] = expert_mask
+            info["normalized_expert_mask"] = normalized_mask
 
         if flag == "test":
             if return_info:
@@ -335,10 +403,18 @@ class JointExpertPredictionHeads(nn.Module):
             raise ValueError("flag must be either 'train' or 'test'.")
 
         target = self._get_target(batch)
-        head_losses = torch.stack(
-            [self.loss_func(pred_by_expert[name], target) for name in self.expert_names]
+        per_sample_head_losses = torch.stack(
+            [
+                self.loss_func_per_sample(pred_by_expert[name], target)
+                for name in self.expert_names
+            ],
+            dim=1,
         )
-        loss = head_losses.mean()
+        if expert_mask is None:
+            loss = per_sample_head_losses.mean()
+        else:
+            loss = (per_sample_head_losses * expert_mask).sum() / expert_mask.sum().clamp_min(1.0)
+        head_losses = per_sample_head_losses.mean(dim=0)
         info.update(
             {
                 "head_loss": loss.detach(),
