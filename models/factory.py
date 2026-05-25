@@ -40,9 +40,40 @@ class FusionModelWithExperts(nn.Module):
             else:
                 model.eval()
 
-    def forward(self, batch, flag="test", **kwargs):
-        batch_tensor = {}
+    def set_active_expert(self, active_expert_name=None):
+        if hasattr(self.fusion_model, "set_active_expert"):
+            self.fusion_model.set_active_expert(active_expert_name)
+
+        if self.experts_frozen:
+            for model in self.expert_models.values():
+                for param in model.parameters():
+                    param.requires_grad = False
+                model.eval()
+            return
+
         for name, model in self.expert_models.items():
+            trainable = active_expert_name is None or name == active_expert_name
+            for param in model.parameters():
+                param.requires_grad = trainable
+            if trainable:
+                model.train()
+            else:
+                model.eval()
+
+    def forward(self, batch, flag="test", active_expert_name=None, **kwargs):
+        batch_tensor = {}
+        if flag == "train" and active_expert_name is not None:
+            if active_expert_name not in self.expert_models:
+                available = ", ".join(self.expert_models.keys())
+                raise KeyError(
+                    f"active_expert_name={active_expert_name!r} is not in "
+                    f"expert_models. Available experts: {available}."
+                )
+            expert_items = [(active_expert_name, self.expert_models[active_expert_name])]
+        else:
+            expert_items = self.expert_models.items()
+
+        for name, model in expert_items:
             if flag == "train" and not self.experts_frozen:
                 model.train()
             else:
@@ -53,6 +84,9 @@ class FusionModelWithExperts(nn.Module):
                     batch_tensor[name] = model.forward_hidden(batch)
             else:
                 batch_tensor[name] = model.forward_hidden(batch)
+
+        if active_expert_name is not None:
+            kwargs["active_expert_name"] = active_expert_name
 
         return self.fusion_model(batch_tensor, batch, flag=flag, **kwargs)
 

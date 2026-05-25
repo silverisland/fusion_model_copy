@@ -78,6 +78,30 @@ class Exp_Main(Exp_Basic):
     def _unwrap_model(self):
         return self.model.module if hasattr(self.model, "module") else self.model
 
+    def _fusion_module(self):
+        model = self._unwrap_model()
+        return model.fusion_model if hasattr(model, "fusion_model") else model
+
+    def _round_robin_expert_names(self):
+        fusion_model = self._fusion_module()
+        if not hasattr(fusion_model, "set_active_expert"):
+            return []
+
+        expert_names = getattr(fusion_model, "expert_names", None)
+        if not expert_names:
+            return []
+        return list(expert_names)
+
+    def _set_active_expert(self, active_expert_name=None):
+        model = self._unwrap_model()
+        if hasattr(model, "set_active_expert"):
+            model.set_active_expert(active_expert_name)
+            return
+
+        fusion_model = self._fusion_module()
+        if hasattr(fusion_model, "set_active_expert"):
+            fusion_model.set_active_expert(active_expert_name)
+
     def _trainable_parameters(self):
         return [p for p in self.model.parameters() if p.requires_grad]
 
@@ -231,6 +255,7 @@ class Exp_Main(Exp_Basic):
 
     def vali(self, vali_data, vali_loader):
         total_loss = []
+        self._set_active_expert(None)
         self.model.eval()
         with torch.no_grad():
             for i, batch in enumerate(vali_loader):
@@ -258,6 +283,12 @@ class Exp_Main(Exp_Basic):
         model_optim = self._select_optimizer()
         scheduler = self._select_scheduler(model_optim, train_steps)
         lradj = str(self.args.lradj).lower()
+        round_robin_experts = self._round_robin_expert_names()
+        if round_robin_experts:
+            print(
+                "Batch round-robin expert-head training enabled: "
+                + " -> ".join(round_robin_experts)
+            )
 
         for epoch in range(self.args.train_epochs):
             new_optim, new_scheduler = self._maybe_unfreeze_experts(
@@ -275,14 +306,39 @@ class Exp_Main(Exp_Basic):
             epoch_time = time.time()
             for i, batch in enumerate(train_loader):
                 iter_count += 1
+                active_expert_name = None
+                if round_robin_experts:
+                    active_index = (epoch * train_steps + i) % len(round_robin_experts)
+                    active_expert_name = round_robin_experts[active_index]
+                    self._set_active_expert(active_expert_name)
+
                 model_optim.zero_grad()
                 batch = self._move_to_device(batch)
 
-                outputs, loss = self.model(batch, flag = 'train')
+                if active_expert_name is None:
+                    outputs, loss = self.model(batch, flag = 'train')
+                else:
+                    outputs, loss = self.model(
+                        batch,
+                        flag='train',
+                        active_expert_name=active_expert_name,
+                    )
                 train_loss.append(loss.item())
 
                 if (i + 1) % 100 == 0:
-                    print("\titers: {0}, epoch: {1} | loss: {2:.7f}".format(i + 1, epoch + 1, loss.item()))
+                    active_msg = (
+                        f" | active_expert: {active_expert_name}"
+                        if active_expert_name is not None
+                        else ""
+                    )
+                    print(
+                        "\titers: {0}, epoch: {1} | loss: {2:.7f}{3}".format(
+                            i + 1,
+                            epoch + 1,
+                            loss.item(),
+                            active_msg,
+                        )
+                    )
                     speed = (time.time() - time_now) / iter_count
                     left_time = speed * ((self.args.train_epochs - epoch) * train_steps - i)
                     print('\tspeed: {:.4f}s/iter; left time: {:.4f}s'.format(speed, left_time))
@@ -311,6 +367,7 @@ class Exp_Main(Exp_Basic):
             elif lradj not in {"none", "constant"}:
                 adjust_learning_rate(model_optim, epoch + 1, self.args)
 
+        self._set_active_expert(None)
         best_model_path = path + '/' + 'checkpoint.pth'
         self.model.load_state_dict(torch.load(best_model_path))
 

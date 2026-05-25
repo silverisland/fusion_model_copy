@@ -130,10 +130,10 @@ class ExpertPredictionHeads(nn.Module):
     """
     Four expert prediction heads over frozen expert hidden states.
 
-    This module intentionally contains no learned fusion gate, attention block,
-    active-expert routing, or round-robin training logic. Each batch trains all
-    available reconstructed expert heads with the same target. In inference the
-    default output is the simple mean of the reconstructed head predictions.
+    This module intentionally contains no learned fusion gate or attention
+    block. During round-robin training, each batch can train one active
+    prediction head. In validation and inference the default output is the
+    simple mean of the reconstructed head predictions.
 
     Expected output shape per head:
         (B, n_features, pred_len)
@@ -179,6 +179,19 @@ class ExpertPredictionHeads(nn.Module):
             )
 
         self.to(device)
+
+    def set_active_expert(self, active_expert_name=None):
+        if active_expert_name is not None and active_expert_name not in self.expert_names:
+            available = ", ".join(self.expert_names)
+            raise KeyError(
+                f"active_expert_name={active_expert_name!r} is not in "
+                f"expert_names. Available experts: {available}."
+            )
+
+        for name, head in self.prediction_heads.items():
+            trainable = active_expert_name is None or name == active_expert_name
+            for param in head.parameters():
+                param.requires_grad = trainable
 
     @classmethod
     def _validate_loss_type(cls, loss_type):
@@ -298,12 +311,44 @@ class ExpertPredictionHeads(nn.Module):
         output = self._format_output(self.prediction_heads[name](hidden))
         return self._denorm_output(output)
 
-    def forward(self, batch_tensor, batch=None, flag="test", return_info=False):
+    def forward(
+        self,
+        batch_tensor,
+        batch=None,
+        flag="test",
+        return_info=False,
+        active_expert_name=None,
+    ):
+        if active_expert_name is not None and active_expert_name not in self.expert_names:
+            available = ", ".join(self.expert_names)
+            raise KeyError(
+                f"active_expert_name={active_expert_name!r} is not in "
+                f"expert_names. Available experts: {available}."
+            )
+
         missing = [name for name in self.expert_names if name not in batch_tensor]
+        if flag == "train" and active_expert_name is not None:
+            missing = [active_expert_name] if active_expert_name not in batch_tensor else []
         if missing:
             raise KeyError("Missing hidden tensors for experts: " + ", ".join(missing))
 
         self._set_revin_statistics(batch)
+
+        if flag == "train" and active_expert_name is not None:
+            pred = self._predict_one(
+                active_expert_name,
+                batch_tensor[active_expert_name],
+            )
+            target = self._get_target(batch)
+            loss = self.loss_func(pred, target)
+            info = {
+                "active_expert_name": active_expert_name,
+                "pred_by_expert": {active_expert_name: pred},
+                "head_loss": loss.detach(),
+            }
+            if return_info:
+                return pred, loss, info
+            return pred, loss
 
         pred_by_expert = {}
         preds = []
