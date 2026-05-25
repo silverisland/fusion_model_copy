@@ -322,7 +322,7 @@ class CompressedExpertHeadFusion(nn.Module):
 
         pv_his = batch["observe_power"].unsqueeze(1)
         tsfm = batch["chronos"].unsqueeze(1)
-        pv = torch.cat([pv_his, tsfm], dim=1)
+        pv = torch.cat([pv_his, tsfm], dim=2)
         pv = pv.permute(0, 2, 1)
         self.pv_revin_layer(pv, "norm")
 
@@ -400,9 +400,6 @@ class CompressedExpertHeadFusion(nn.Module):
             if return_info:
                 return output, info
             return output.squeeze(1)
-
-        if flag != "train":
-            raise ValueError("flag must be either 'train' or 'test'.")
 
         target = self._get_target(batch)
         main_loss = self.loss_func(output, target)

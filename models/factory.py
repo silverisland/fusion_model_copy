@@ -5,38 +5,18 @@ import torch.nn as nn
 
 from .fusion.base import FusionBase
 from .fusion.expert_head import ExpertHeadReconstruction, MultiExpertHeadFusion
-from .fusion.expert_head_v2 import AlignedExpertHeadFusion
-from .fusion.expert_head_v3 import CompressedExpertHeadFusion
-from .fusion.expert_head_v4 import OrthogonalAttentionExpertHeadFusion
 from .fusion.expert_head_v5 import FlattenOrthogonalAttentionExpertHeadFusion
-from .fusion.expert_head_v6 import ExpertSpecificAttentionFusion
 from .fusion.expert_head_v7 import ConstrainedExpertHeadFusion
 from .fusion.expert_head_v8 import WeatherAwareExpertHeadFusion
-from .fusion.legacy import FusionModel as FusionLegacy
-from .fusion.tensor_v3 import FusionModelV3 as FusionTensorV3
-from .fusion.v2 import FusionModel as FusionV2
-from .fusion.v3 import FusionModelV3
-from .fusion.v4 import FusionModelV4
-from .fusion.v5 import FusionModelV5
 
 
 FUSION_REGISTRY = {
     "base": FusionBase,
     "expert_head": ExpertHeadReconstruction,
     "multi_expert_head": MultiExpertHeadFusion,
-    "expert_head_v2": AlignedExpertHeadFusion,
-    "expert_head_v3": CompressedExpertHeadFusion,
-    "expert_head_v4": OrthogonalAttentionExpertHeadFusion,
     "expert_head_v5": FlattenOrthogonalAttentionExpertHeadFusion,
-    "expert_head_v6": ExpertSpecificAttentionFusion,
     "expert_head_v7": ConstrainedExpertHeadFusion,
     "expert_head_v8": WeatherAwareExpertHeadFusion,
-    "legacy": FusionLegacy,
-    "v2": FusionV2,
-    "v3": FusionModelV3,
-    "v4": FusionModelV4,
-    "v5": FusionModelV5,
-    "tensor_v3": FusionTensorV3,
 }
 
 DEFAULT_FUSION_VERSION = "base"
@@ -44,16 +24,9 @@ HIDDEN_ONLY_FUSION_VERSIONS = {
     "base",
     "expert_head",
     "multi_expert_head",
-    "expert_head_v2",
-    "expert_head_v3",
-    "expert_head_v4",
     "expert_head_v5",
-    "expert_head_v6",
     "expert_head_v7",
     "expert_head_v8",
-    "v4",
-    "v5",
-    "tensor_v3",
 }
 
 
