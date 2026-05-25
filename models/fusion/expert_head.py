@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from layers.revin import RevIN    
 
 
 class M1PredictionHead(nn.Module):
@@ -183,7 +184,8 @@ class ExpertHeadReconstruction(nn.Module):
             pred_len=pred_len,
             n_features=n_features,
         )
-
+        
+        self.pv_revin_layer = RevIN(1, affine=1, subtract_last=0)
         self.to(device)
 
     @classmethod
@@ -274,9 +276,21 @@ class ExpertHeadReconstruction(nn.Module):
                 f"Available hidden tensors: {available}."
             )
 
+        pv_his = batch['observe_power'].unsqueeze(1)
+        tsfm = batch['chronos'].unsqueeze(1)
+        pv = torch.cat([pv_his, tsfm], dim=2)
+        pv = pv.permute(0, 2, 1)
+        pv = self.pv_revin_layer(pv, 'norm')
+        pv = pv.permute(0, 2, 1)
+        
         hidden = batch_tensor[self.expert_name]
+        
         output = self._format_output(self.prediction_head(hidden))
 
+        output = output.permute(0, 2, 1)
+        output = self.pv_revin_layer(output, 'denorm')
+        output = output.permute(0, 2, 1)
+        
         if flag == "test":
             if return_info:
                 return output, {"expert_name": self.expert_name, "hidden": hidden}
@@ -329,6 +343,8 @@ class MultiExpertHeadFusion(nn.Module):
         self._validate_loss_type(loss_type)
         resolved_dims = self._resolve_hidden_dims(expert_dims)
 
+        self.pv_revin_layer = RevIN(1, affine=1, subtract_last=0)
+        
         self.prediction_heads = nn.ModuleDict()
         for name in self.expert_names:
             head_cls = EXPERT_HEAD_REGISTRY[name]
@@ -342,6 +358,21 @@ class MultiExpertHeadFusion(nn.Module):
 
         self.expert_logits = nn.Parameter(torch.zeros(len(self.expert_names)))
         self.to(device)
+
+    def set_active_expert(self, active_expert_name=None):
+        if active_expert_name is not None and active_expert_name not in self.expert_names:
+            available = ", ".join(self.expert_names)
+            raise KeyError(
+                f"active_expert_name={active_expert_name!r} is not in "
+                f"expert_names. Available experts: {available}."
+            )
+
+        for name, head in self.prediction_heads.items():
+            trainable = active_expert_name is None or name == active_expert_name
+            for param in head.parameters():
+                param.requires_grad = trainable
+
+        self.expert_logits.requires_grad = active_expert_name is None
 
     @classmethod
     def _validate_loss_type(cls, loss_type):
@@ -426,15 +457,61 @@ class MultiExpertHeadFusion(nn.Module):
             return F.huber_loss(pred, target, delta=1.0)
         raise ValueError(f"Unknown loss_type={self.loss_type!r}")
 
-    def forward(self, batch_tensor, batch=None, flag="test", return_info=False):
+    def _predict_one(self, name, hidden):
+        pred = self._format_output(self.prediction_heads[name](hidden))
+        pred = pred.permute(0, 2, 1)
+        pred = self.pv_revin_layer(pred, 'denorm')
+        pred = pred.permute(0, 2, 1)
+        return pred
+
+    def forward(
+        self,
+        batch_tensor,
+        batch=None,
+        flag="test",
+        return_info=False,
+        active_expert_name=None,
+    ):
+        if active_expert_name is not None and active_expert_name not in self.expert_names:
+            available = ", ".join(self.expert_names)
+            raise KeyError(
+                f"active_expert_name={active_expert_name!r} is not in "
+                f"expert_names. Available experts: {available}."
+            )
+
         missing = [name for name in self.expert_names if name not in batch_tensor]
+        if flag == "train" and active_expert_name is not None:
+            missing = [active_expert_name] if active_expert_name not in batch_tensor else []
         if missing:
             raise KeyError("Missing hidden tensors for experts: " + ", ".join(missing))
+
+        pv_his = batch['observe_power'].unsqueeze(1)
+        tsfm = batch['chronos'].unsqueeze(1)
+        pv = torch.cat([pv_his, tsfm], dim=2)
+        pv = pv.permute(0, 2, 1)
+        pv = self.pv_revin_layer(pv, 'norm')
+        pv = pv.permute(0, 2, 1)
+
+        if flag == "train" and active_expert_name is not None:
+            pred = self._predict_one(
+                active_expert_name,
+                batch_tensor[active_expert_name],
+            )
+            target = self._get_target(batch)
+            loss = self.loss_func(pred, target)
+            info = {
+                "active_expert_name": active_expert_name,
+                "pred_by_expert": {active_expert_name: pred},
+                "main_loss": loss.detach(),
+            }
+            if return_info:
+                return pred, loss, info
+            return pred, loss
 
         pred_by_expert = {}
         preds = []
         for name in self.expert_names:
-            pred = self._format_output(self.prediction_heads[name](batch_tensor[name]))
+            pred = self._predict_one(name, batch_tensor[name])
             pred_by_expert[name] = pred
             preds.append(pred)
 

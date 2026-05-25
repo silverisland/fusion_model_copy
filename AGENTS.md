@@ -6,6 +6,50 @@ This repository is a PyTorch time-series fusion project for photovoltaic power f
 
 There is currently no dedicated `tests/` directory. Use focused smoke tests and `py_compile` checks before committing.
 
+## Current Research Direction
+
+The current priority is expert prediction-head reconstruction, not adding more
+complex hidden-fusion variants. Before optimizing `v4`, `v5`, `tensor_v3`, or
+new MoE/attention fusion designs, first verify that the framework can preserve
+each expert's original forecasting ability:
+
+```text
+original expert prediction
+-> forward_hidden(batch) + copied original prediction head
+-> trained reconstructed expert head
+-> multiple reconstructed heads
+-> prediction-level fusion
+-> hidden-assisted gate or residual fusion
+```
+
+The key sanity check is:
+
+```text
+forward_hidden(batch) + copied original prediction head
+~= original expert prediction
+```
+
+If this fails, prioritize fixing the expert `forward_hidden` interface,
+prediction-head reconstruction, target shape, and normalization path before
+working on complex fusion architecture.
+
+Current model roles:
+
+- `models/fusion/expert_head.py`: active mainline; replace placeholder heads
+  with real expert prediction heads.
+- `models/fusion/base.py`: hidden linear-probing baseline.
+- `models/fusion/v4.py`, `models/fusion/v5.py`, `models/fusion/tensor_v3.py`:
+  keep as comparison candidates, but do not treat them as the current mainline
+  until expert-head reconstruction passes.
+- `models/fusion/v2.py`, `models/fusion/v3.py`, `models/fusion/legacy.py`, and
+  `models/fusion/tensor_legacy.py`: historical experiments; modify cautiously.
+
+Use these docs as the current reference:
+
+- `docs/EXPERIMENT_PLAN_EXPERT_HEAD_FUSION.md`
+- `docs/README_COLLEAGUES.md`
+- `docs/REFLECT_FUSION_MODEL.md`
+
 ## Build, Test, and Development Commands
 
 Use the Pixi environment Python:
@@ -55,3 +99,8 @@ Pull requests should describe the experiment or behavior changed, list validatio
 ## Configuration & Safety Notes
 
 Do not commit private datasets, checkpoints, or machine-specific paths. Keep `configs/*.yaml` portable, and document required external expert model packages when a fusion version depends on them.
+
+The default target key is `observe_power_future`. Some historical fusion
+versions still hard-code `target_power` in their training path, especially
+`legacy` and `tensor_v3`; either provide that field explicitly or update their
+target-reading logic before using them in new experiments.

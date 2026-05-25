@@ -1,4 +1,10 @@
-# 异构时序预测模型融合预训练架构 (PackerMoEFusion) 技术方案
+# Archived: 异构时序预测模型融合预训练架构 (PackerMoEFusion) 技术方案
+
+> Archive note: this is an early concept document. It describes long-term ideas
+> such as contrastive alignment, two-stage pretraining, Dynamic RevIN, PEFT, and
+> elastic query resizing. These are not current implemented capabilities. Use
+> `docs/EXPERIMENT_PLAN_EXPERT_HEAD_FUSION.md` and
+> `docs/REFLECT_FUSION_MODEL.md` for current experiments.
 
 ## 一、 背景与动机
 在复杂时空序列预测任务中，单一架构模型（如基于注意力的 Transformer 或基于分解的 MLP）受限于特定的归纳偏置（Inductive Bias），难以兼顾长程依赖建模与局部趋势捕捉。引入异构模型融合架构，通过大规模数据驱动构建“元表征中心”，自动协同、解耦并重组不同基模型的知识，是提升预测精度与鲁棒性的必然趋势。
