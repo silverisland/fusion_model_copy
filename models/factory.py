@@ -3,30 +3,16 @@ import inspect
 import torch
 import torch.nn as nn
 
-from .fusion.base import FusionBase
-from .fusion.expert_head import ExpertHeadReconstruction, MultiExpertHeadFusion
-from .fusion.expert_head_v5 import FlattenOrthogonalAttentionExpertHeadFusion
-from .fusion.expert_head_v7 import ConstrainedExpertHeadFusion
-from .fusion.expert_head_v8 import WeatherAwareExpertHeadFusion
+from .fusion.expert_head import ExpertPredictionHeads
 
 
 FUSION_REGISTRY = {
-    "base": FusionBase,
-    "expert_head": ExpertHeadReconstruction,
-    "multi_expert_head": MultiExpertHeadFusion,
-    "expert_head_v5": FlattenOrthogonalAttentionExpertHeadFusion,
-    "expert_head_v7": ConstrainedExpertHeadFusion,
-    "expert_head_v8": WeatherAwareExpertHeadFusion,
+    "expert_head": ExpertPredictionHeads,
 }
 
-DEFAULT_FUSION_VERSION = "base"
+DEFAULT_FUSION_VERSION = "expert_head"
 HIDDEN_ONLY_FUSION_VERSIONS = {
-    "base",
     "expert_head",
-    "multi_expert_head",
-    "expert_head_v5",
-    "expert_head_v7",
-    "expert_head_v8",
 }
 
 
@@ -54,40 +40,9 @@ class FusionModelWithExperts(nn.Module):
             else:
                 model.eval()
 
-    def set_active_expert(self, active_expert_name=None):
-        if hasattr(self.fusion_model, "set_active_expert"):
-            self.fusion_model.set_active_expert(active_expert_name)
-
-        if self.experts_frozen:
-            for model in self.expert_models.values():
-                for param in model.parameters():
-                    param.requires_grad = False
-                model.eval()
-            return
-
-        for name, model in self.expert_models.items():
-            trainable = active_expert_name is None or name == active_expert_name
-            for param in model.parameters():
-                param.requires_grad = trainable
-            if trainable:
-                model.train()
-            else:
-                model.eval()
-
-    def forward(self, batch, flag="test", active_expert_name=None, **kwargs):
+    def forward(self, batch, flag="test", **kwargs):
         batch_tensor = {}
-        if flag == "train" and active_expert_name is not None:
-            if active_expert_name not in self.expert_models:
-                available = ", ".join(self.expert_models.keys())
-                raise KeyError(
-                    f"active_expert_name={active_expert_name!r} is not in "
-                    f"expert_models. Available experts: {available}."
-                )
-            expert_items = [(active_expert_name, self.expert_models[active_expert_name])]
-        else:
-            expert_items = self.expert_models.items()
-
-        for name, model in expert_items:
+        for name, model in self.expert_models.items():
             if flag == "train" and not self.experts_frozen:
                 model.train()
             else:
@@ -98,9 +53,6 @@ class FusionModelWithExperts(nn.Module):
                     batch_tensor[name] = model.forward_hidden(batch)
             else:
                 batch_tensor[name] = model.forward_hidden(batch)
-
-        if active_expert_name is not None:
-            kwargs["active_expert_name"] = active_expert_name
 
         return self.fusion_model(batch_tensor, batch, flag=flag, **kwargs)
 
@@ -164,31 +116,10 @@ def build_fusion_model(args, base_models=None, device=None):
     model_cls = get_fusion_model_class(version)
 
     expert_dims = parse_expert_dims(getattr(args, "fusion_expert_dims", None))
-    aligned_tokens = parse_expert_dims(getattr(args, "fusion_aligned_tokens", None))
     expert_names = parse_expert_names(getattr(args, "fusion_expert_names", None))
-    aligned_token_count = getattr(args, "fusion_aligned_token_count", None)
-    adapter_type = getattr(args, "fusion_adapter_type", None)
-    d_fusion = getattr(args, "fusion_d_model", None)
     dropout = getattr(args, "fusion_dropout", None)
     target_key = getattr(args, "target_key", None)
     loss_type = getattr(args, "fusion_loss", None)
-    expert_name = getattr(args, "fusion_expert_name", None)
-    aux_loss_weight = getattr(args, "fusion_aux_loss_weight", None)
-    orth_loss_weight = getattr(args, "fusion_orth_loss_weight", None)
-    attention_heads = getattr(args, "fusion_attention_heads", None)
-    attention_layers = getattr(args, "fusion_attention_layers", None)
-    attention_query_tokens = getattr(args, "fusion_attention_query_tokens", None)
-    ensemble_size = getattr(args, "fusion_ensemble_size", None)
-    ensemble_scaling_init = getattr(args, "fusion_ensemble_scaling_init", None)
-    expert_drop_prob = getattr(args, "fusion_expert_drop_prob", None)
-    gate_temperature = getattr(args, "fusion_gate_temperature", None)
-    gate_reg_weight = getattr(args, "fusion_gate_reg_weight", None)
-    base_loss_weight = getattr(args, "fusion_base_loss_weight", None)
-    weather_keys = parse_expert_names(getattr(args, "fusion_weather_keys", None))
-    focus_loss_start = getattr(args, "fusion_focus_loss_start", None)
-    focus_loss_end = getattr(args, "fusion_focus_loss_end", None)
-    focus_loss_weight = getattr(args, "fusion_focus_loss_weight", None)
-    full_loss_weight = getattr(args, "fusion_full_loss_weight", None)
 
     constructor_kwargs = {
         "models_dict": base_models,
@@ -197,30 +128,9 @@ def build_fusion_model(args, base_models=None, device=None):
         "n_features": args.enc_in,
         "expert_dims": expert_dims,
         "expert_names": expert_names,
-        "aligned_tokens": aligned_tokens,
-        "aligned_token_count": aligned_token_count,
-        "adapter_type": adapter_type,
-        "d_fusion": d_fusion,
         "dropout": dropout,
         "target_key": target_key,
         "loss_type": loss_type,
-        "expert_name": expert_name,
-        "aux_loss_weight": aux_loss_weight,
-        "orth_loss_weight": orth_loss_weight,
-        "attention_heads": attention_heads,
-        "attention_layers": attention_layers,
-        "attention_query_tokens": attention_query_tokens,
-        "ensemble_size": ensemble_size,
-        "ensemble_scaling_init": ensemble_scaling_init,
-        "expert_drop_prob": expert_drop_prob,
-        "gate_temperature": gate_temperature,
-        "gate_reg_weight": gate_reg_weight,
-        "base_loss_weight": base_loss_weight,
-        "weather_keys": weather_keys,
-        "focus_loss_start": focus_loss_start,
-        "focus_loss_end": focus_loss_end,
-        "focus_loss_weight": focus_loss_weight,
-        "full_loss_weight": full_loss_weight,
         "device": device,
     }
     constructor_kwargs = _filter_constructor_kwargs(model_cls, constructor_kwargs)

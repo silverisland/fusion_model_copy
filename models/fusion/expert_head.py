@@ -1,11 +1,12 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from layers.revin import RevIN    
+
+from layers.revin import RevIN
 
 
 class M1PredictionHead(nn.Module):
-    # M1 模型输出的形状是(batchsize, 9, 128)
+    # M1 hidden shape: (B, 9, 128)
     def __init__(
         self,
         nf=9 * 128,
@@ -17,7 +18,7 @@ class M1PredictionHead(nn.Module):
         super().__init__()
         target_window = pred_len if target_window is None else target_window
         self.flatten = nn.Flatten(start_dim=-2)
-        self.linear = nn.Linear(nf, target_window) 
+        self.linear = nn.Linear(nf, target_window)
         self.dropout = nn.Dropout(head_dropout)
 
     def forward(self, hidden):
@@ -28,7 +29,7 @@ class M1PredictionHead(nn.Module):
 
 
 class M2PredictionHead(nn.Module):
-    # M2 模型输出的形状是(batchsize, 2, 512)
+    # M2 hidden shape: (B, 2, 512)
     def __init__(
         self,
         hidden_channels=2,
@@ -36,40 +37,36 @@ class M2PredictionHead(nn.Module):
         dropout_rate=0,
         pred_len=192,
         head_dropout=None,
-        **kwargs,
+        **_,
     ):
         super().__init__()
         if head_dropout is not None:
             dropout_rate = head_dropout
         self.channel = hidden_channels
         self.targetseq_len = pred_len
-        
-        # 有几个channel 就有几个独立的 regression_head (如果不共享权重)
-        self.regression_heads = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim * 2),
-                nn.GELU(),
-                nn.Dropout(dropout_rate),
-                nn.Linear(hidden_dim * 2, self.targetseq_len),
-            ) for _ in range(self.channel)
-        ])
+        self.regression_heads = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Linear(hidden_dim, hidden_dim * 2),
+                    nn.GELU(),
+                    nn.Dropout(dropout_rate),
+                    nn.Linear(hidden_dim * 2, self.targetseq_len),
+                )
+                for _ in range(self.channel)
+            ]
+        )
 
     def forward(self, hidden):
-        # hidden shape: (batch_size, channel, hidden_dim)
         if hidden.shape[1] != self.channel:
             raise ValueError(
                 f"M2 hidden channel must be {self.channel}, got {hidden.shape[1]}."
             )
-        # 使用列表推导式和 torch.stack 避免 pre-allocate zeros 带来的开销和潜在的 device 匹配问题
         preds = [self.regression_heads[i](hidden[:, i, :]) for i in range(self.channel)]
-        
-        # 沿着 channel 维度 (dim=1) 堆叠，输出 shape: (batch_size, channel, targetseq_len)
         return torch.stack(preds, dim=1).mean(dim=1)
 
 
-
 class M3PredictionHead(nn.Module):
-    # M3 模型输出的形状是(batchsize, 162, 384)
+    # M3 hidden shape: (B, 162, 384)
     def __init__(
         self,
         in_dim=162 * 384,
@@ -80,9 +77,9 @@ class M3PredictionHead(nn.Module):
     ):
         super().__init__()
         out_dim = pred_len if out_dim is None else out_dim
-        self.flatten = nn.Flatten(start_dim = 1)
-        self.linear = nn.Linear(in_dim, out_dim) 
+        self.flatten = nn.Flatten(start_dim=1)
         self.dropout = nn.Dropout(head_dropout)
+        self.linear = nn.Linear(in_dim, out_dim)
 
     def forward(self, hidden):
         hidden = self.flatten(hidden)
@@ -91,9 +88,8 @@ class M3PredictionHead(nn.Module):
         return hidden
 
 
-
 class M4PredictionHead(nn.Module):
-    # M4 模型输出的形状是(batchsize, 5, 9, 256)
+    # M4 hidden shape: (B, 5, 9, 256)
     def __init__(
         self,
         nf=5 * 9 * 256,
@@ -104,25 +100,22 @@ class M4PredictionHead(nn.Module):
     ):
         super().__init__()
         target_window = pred_len if target_window is None else target_window
-        self.flatten = nn.Flatten(start_dim = -3)
+        self.flatten = nn.Flatten(start_dim=-3)
         layers = []
         hidden_sizes = [1024, 256, 64]
-        prev_size = nf 
+        prev_size = nf
         for hidden_size in hidden_sizes:
             layers.append(nn.Linear(prev_size, hidden_size))
             layers.append(nn.LayerNorm(hidden_size))
             layers.append(nn.ReLU())
             layers.append(nn.Dropout(head_dropout))
             prev_size = hidden_size
-        
         layers.append(nn.Linear(prev_size, target_window))
-
         self.model = nn.Sequential(*layers)
 
     def forward(self, hidden):
-        x = self.flatten(hidden)       # (B, nf)
-        x = self.model(x)           # (B, target_window)
-        return x
+        hidden = self.flatten(hidden)
+        return self.model(hidden)
 
 
 EXPERT_HEAD_REGISTRY = {
@@ -133,25 +126,21 @@ EXPERT_HEAD_REGISTRY = {
 }
 
 
-class ExpertHeadReconstruction(nn.Module):
+class ExpertPredictionHeads(nn.Module):
     """
-    Single-expert head reconstruction experiment.
+    Four expert prediction heads over frozen expert hidden states.
 
-    This module does not fuse multiple experts. It selects one frozen expert's
-    hidden state from batch_tensor, feeds it into a newly initialized prediction
-    head with the same intended structure as that expert's original head, and
-    trains only this new head.
+    This module intentionally contains no learned fusion gate, attention block,
+    active-expert routing, or round-robin training logic. Each batch trains all
+    available reconstructed expert heads with the same target. In inference the
+    default output is the simple mean of the reconstructed head predictions.
 
-    Expected input:
-        batch_tensor[expert_name]: hidden state from the selected expert.
-        batch[target_key]: forecast target during training.
-
-    Output shape:
+    Expected output shape per head:
         (B, n_features, pred_len)
     """
 
     DEFAULT_EXPERT_DIMS = {"m1": 128, "m2": 512, "m3": 384, "m4": 256}
-    SUPPORTED_LOSSES = {"mse", "mae", "huber"}
+    SUPPORTED_LOSSES = {"mse", "mae", "huber", "rmse"}
 
     def __init__(
         self,
@@ -160,174 +149,9 @@ class ExpertHeadReconstruction(nn.Module):
         pred_len=192,
         n_features=1,
         expert_dims=None,
-        expert_name="m1",
+        expert_names=None,
         target_key="observe_power_future",
         loss_type="mse",
-        device="cuda",
-    ):
-        super().__init__()
-        self.seq_len = seq_len
-        self.pred_len = pred_len
-        self.n_features = n_features
-        self.expert_name = expert_name
-        self.target_key = target_key
-        self.loss_type = loss_type
-
-        self._validate_loss_type(loss_type)
-        self._validate_expert_name(models_dict)
-        hidden_dim = self._resolve_hidden_dim(expert_dims)
-
-        head_cls = EXPERT_HEAD_REGISTRY[expert_name]
-        self.prediction_head = head_cls(
-            hidden_dim=hidden_dim,
-            seq_len=seq_len,
-            pred_len=pred_len,
-            n_features=n_features,
-        )
-        
-        self.pv_revin_layer = RevIN(1, affine=1, subtract_last=0)
-        self.to(device)
-
-    @classmethod
-    def _validate_loss_type(cls, loss_type):
-        if loss_type not in cls.SUPPORTED_LOSSES:
-            valid = ", ".join(sorted(cls.SUPPORTED_LOSSES))
-            raise ValueError(f"Unknown loss_type={loss_type!r}. Valid: {valid}.")
-
-    def _validate_expert_name(self, models_dict):
-        if self.expert_name not in EXPERT_HEAD_REGISTRY:
-            valid = ", ".join(sorted(EXPERT_HEAD_REGISTRY))
-            raise ValueError(
-                f"Unknown expert_name={self.expert_name!r}. Valid: {valid}."
-            )
-
-        if models_dict is not None and self.expert_name not in models_dict:
-            available = ", ".join(models_dict.keys())
-            raise ValueError(
-                f"expert_name={self.expert_name!r} is not in models_dict. "
-                f"Available experts: {available}."
-            )
-
-    def _resolve_hidden_dim(self, expert_dims):
-        resolved_dims = dict(self.DEFAULT_EXPERT_DIMS)
-        if expert_dims is not None:
-            resolved_dims.update(expert_dims)
-
-        if self.expert_name not in resolved_dims:
-            raise ValueError(
-                f"Missing expert_dims for {self.expert_name!r}. "
-                "ExpertHeadReconstruction needs the selected expert hidden dimension."
-            )
-        return resolved_dims[self.expert_name]
-
-    def _format_output(self, output):
-        if output.dim() == 2:
-            output = output.unsqueeze(1)
-        elif output.dim() == 3 and output.shape[1] == self.pred_len:
-            output = output.transpose(1, 2)
-
-        expected_shape = (output.shape[0], self.n_features, self.pred_len)
-        if tuple(output.shape) != expected_shape:
-            raise ValueError(
-                f"Prediction head output must be {expected_shape}, "
-                f"got {tuple(output.shape)}."
-            )
-        return output
-
-    def _get_target(self, batch):
-        if batch is None:
-            raise ValueError("batch is required when flag is not 'test'.")
-
-        if self.target_key in batch:
-            target = batch[self.target_key]
-        elif "target_power" in batch:
-            target = batch["target_power"]
-        else:
-            raise KeyError(
-                f"Cannot find target key '{self.target_key}' or 'target_power' in batch."
-            )
-
-        if target.dim() == 2:
-            target = target.unsqueeze(1)
-        elif target.dim() == 3 and target.shape[1] == self.pred_len:
-            target = target.transpose(1, 2)
-
-        expected_shape = (target.shape[0], self.n_features, self.pred_len)
-        if tuple(target.shape) != expected_shape:
-            raise ValueError(
-                f"Target shape must be {expected_shape}, got {tuple(target.shape)}."
-            )
-        return target
-
-    def loss_func(self, pred, target):
-        if self.loss_type == "mse":
-            return F.mse_loss(pred, target)
-        if self.loss_type == "mae":
-            return F.l1_loss(pred, target)
-        if self.loss_type == "huber":
-            return F.huber_loss(pred, target, delta=1.0)
-        raise ValueError(f"Unknown loss_type={self.loss_type!r}")
-
-    def forward(self, batch_tensor, batch=None, flag="test", return_info=False):
-        if self.expert_name not in batch_tensor:
-            available = ", ".join(batch_tensor.keys())
-            raise KeyError(
-                f"Missing hidden tensor for expert {self.expert_name!r}. "
-                f"Available hidden tensors: {available}."
-            )
-
-        pv_his = batch['observe_power'].unsqueeze(1)
-        tsfm = batch['chronos'].unsqueeze(1)
-        pv = torch.cat([pv_his, tsfm], dim=2)
-        pv = pv.permute(0, 2, 1)
-        pv = self.pv_revin_layer(pv, 'norm')
-        pv = pv.permute(0, 2, 1)
-        
-        hidden = batch_tensor[self.expert_name]
-        
-        output = self._format_output(self.prediction_head(hidden))
-
-        output = output.permute(0, 2, 1)
-        output = self.pv_revin_layer(output, 'denorm')
-        output = output.permute(0, 2, 1)
-        
-        if flag == "test":
-            if return_info:
-                return output, {"expert_name": self.expert_name, "hidden": hidden}
-            return output.squeeze(1)
-
-        if flag != "train":
-            raise ValueError("flag must be either 'train' or 'test'.")
-
-        target = self._get_target(batch)
-        loss = self.loss_func(output, target)
-        if return_info:
-            return output, loss, {"expert_name": self.expert_name, "hidden": hidden}
-        return output, loss
-
-
-class MultiExpertHeadFusion(nn.Module):
-    """
-    Jointly trains all reconstructed expert heads with auxiliary supervision.
-
-    Each frozen expert hidden state is decoded by its own prediction head. The
-    final forecast is a learned weighted average of the four head predictions,
-    while each individual head is still supervised against the target.
-    """
-
-    DEFAULT_EXPERT_DIMS = ExpertHeadReconstruction.DEFAULT_EXPERT_DIMS
-    SUPPORTED_LOSSES = ExpertHeadReconstruction.SUPPORTED_LOSSES
-
-    def __init__(
-        self,
-        models_dict=None,
-        seq_len=None,
-        pred_len=192,
-        n_features=1,
-        expert_dims=None,
-        target_key="observe_power_future",
-        loss_type="mse",
-        aux_loss_weight=1.0,
         dropout=0.0,
         device="cuda",
     ):
@@ -337,14 +161,12 @@ class MultiExpertHeadFusion(nn.Module):
         self.n_features = n_features
         self.target_key = target_key
         self.loss_type = loss_type
-        self.aux_loss_weight = aux_loss_weight
-        self.expert_names = self._resolve_expert_names(models_dict)
+        self.expert_names = self._resolve_expert_names(models_dict, expert_names)
 
         self._validate_loss_type(loss_type)
         resolved_dims = self._resolve_hidden_dims(expert_dims)
 
         self.pv_revin_layer = RevIN(1, affine=1, subtract_last=0)
-        
         self.prediction_heads = nn.ModuleDict()
         for name in self.expert_names:
             head_cls = EXPERT_HEAD_REGISTRY[name]
@@ -356,23 +178,7 @@ class MultiExpertHeadFusion(nn.Module):
                 head_dropout=dropout,
             )
 
-        self.expert_logits = nn.Parameter(torch.zeros(len(self.expert_names)))
         self.to(device)
-
-    def set_active_expert(self, active_expert_name=None):
-        if active_expert_name is not None and active_expert_name not in self.expert_names:
-            available = ", ".join(self.expert_names)
-            raise KeyError(
-                f"active_expert_name={active_expert_name!r} is not in "
-                f"expert_names. Available experts: {available}."
-            )
-
-        for name, head in self.prediction_heads.items():
-            trainable = active_expert_name is None or name == active_expert_name
-            for param in head.parameters():
-                param.requires_grad = trainable
-
-        self.expert_logits.requires_grad = active_expert_name is None
 
     @classmethod
     def _validate_loss_type(cls, loss_type):
@@ -380,32 +186,42 @@ class MultiExpertHeadFusion(nn.Module):
             valid = ", ".join(sorted(cls.SUPPORTED_LOSSES))
             raise ValueError(f"Unknown loss_type={loss_type!r}. Valid: {valid}.")
 
-    def _resolve_expert_names(self, models_dict):
-        if models_dict is None:
-            return list(EXPERT_HEAD_REGISTRY.keys())
+    def _resolve_expert_names(self, models_dict, expert_names):
+        if expert_names is not None:
+            names = list(expert_names)
+        elif models_dict is None:
+            names = list(EXPERT_HEAD_REGISTRY.keys())
+        else:
+            names = list(models_dict.keys())
 
-        expert_names = list(models_dict.keys())
-        unsupported = [name for name in expert_names if name not in EXPERT_HEAD_REGISTRY]
+        unsupported = [name for name in names if name not in EXPERT_HEAD_REGISTRY]
         if unsupported:
             valid = ", ".join(sorted(EXPERT_HEAD_REGISTRY))
             raise ValueError(
-                "Unsupported experts for multi_expert_head: "
+                "Unsupported experts for expert_head: "
                 + ", ".join(unsupported)
                 + f". Valid: {valid}."
             )
-        return expert_names
+        if models_dict is not None:
+            missing = [name for name in names if name not in models_dict]
+            if missing:
+                raise ValueError(
+                    "fusion_expert_names contains experts not in models_dict: "
+                    + ", ".join(missing)
+                )
+        return names
 
     def _resolve_hidden_dims(self, expert_dims):
         resolved_dims = dict(self.DEFAULT_EXPERT_DIMS)
         if expert_dims is not None:
             resolved_dims.update(expert_dims)
 
-        missing_dims = [name for name in self.expert_names if name not in resolved_dims]
-        if missing_dims:
+        missing = [name for name in self.expert_names if name not in resolved_dims]
+        if missing:
             raise ValueError(
                 "Missing expert_dims for: "
-                + ", ".join(missing_dims)
-                + ". MultiExpertHeadFusion needs each expert hidden dimension."
+                + ", ".join(missing)
+                + ". ExpertPredictionHeads needs each expert hidden dimension."
             )
         return resolved_dims
 
@@ -451,62 +267,43 @@ class MultiExpertHeadFusion(nn.Module):
     def loss_func(self, pred, target):
         if self.loss_type == "mse":
             return F.mse_loss(pred, target)
+        if self.loss_type == "rmse":
+            return torch.sqrt(F.mse_loss(pred, target) + 1e-8)
         if self.loss_type == "mae":
             return F.l1_loss(pred, target)
         if self.loss_type == "huber":
             return F.huber_loss(pred, target, delta=1.0)
         raise ValueError(f"Unknown loss_type={self.loss_type!r}")
 
+    def _set_revin_statistics(self, batch):
+        if batch is None:
+            raise ValueError("batch is required for RevIN normalization.")
+        pv_his = batch["observe_power"].unsqueeze(1)
+        if "chronos" in batch:
+            chronos = batch["chronos"].unsqueeze(1)
+            pv = torch.cat([pv_his, chronos], dim=2)
+        else:
+            pv = pv_his
+        pv = pv.permute(0, 2, 1)
+        self.pv_revin_layer(pv, "norm")
+
+    def _denorm_output(self, output):
+        output = output.permute(0, 2, 1)
+        output = self.pv_revin_layer(output, "denorm")
+        if output.shape[-1] != self.n_features:
+            output = output[..., : self.n_features]
+        return output.permute(0, 2, 1)
+
     def _predict_one(self, name, hidden):
-        pred = self._format_output(self.prediction_heads[name](hidden))
-        pred = pred.permute(0, 2, 1)
-        pred = self.pv_revin_layer(pred, 'denorm')
-        pred = pred.permute(0, 2, 1)
-        return pred
+        output = self._format_output(self.prediction_heads[name](hidden))
+        return self._denorm_output(output)
 
-    def forward(
-        self,
-        batch_tensor,
-        batch=None,
-        flag="test",
-        return_info=False,
-        active_expert_name=None,
-    ):
-        if active_expert_name is not None and active_expert_name not in self.expert_names:
-            available = ", ".join(self.expert_names)
-            raise KeyError(
-                f"active_expert_name={active_expert_name!r} is not in "
-                f"expert_names. Available experts: {available}."
-            )
-
+    def forward(self, batch_tensor, batch=None, flag="test", return_info=False):
         missing = [name for name in self.expert_names if name not in batch_tensor]
-        if flag == "train" and active_expert_name is not None:
-            missing = [active_expert_name] if active_expert_name not in batch_tensor else []
         if missing:
             raise KeyError("Missing hidden tensors for experts: " + ", ".join(missing))
 
-        pv_his = batch['observe_power'].unsqueeze(1)
-        tsfm = batch['chronos'].unsqueeze(1)
-        pv = torch.cat([pv_his, tsfm], dim=2)
-        pv = pv.permute(0, 2, 1)
-        pv = self.pv_revin_layer(pv, 'norm')
-        pv = pv.permute(0, 2, 1)
-
-        if flag == "train" and active_expert_name is not None:
-            pred = self._predict_one(
-                active_expert_name,
-                batch_tensor[active_expert_name],
-            )
-            target = self._get_target(batch)
-            loss = self.loss_func(pred, target)
-            info = {
-                "active_expert_name": active_expert_name,
-                "pred_by_expert": {active_expert_name: pred},
-                "main_loss": loss.detach(),
-            }
-            if return_info:
-                return pred, loss, info
-            return pred, loss
+        self._set_revin_statistics(batch)
 
         pred_by_expert = {}
         preds = []
@@ -516,12 +313,9 @@ class MultiExpertHeadFusion(nn.Module):
             preds.append(pred)
 
         pred_stack = torch.stack(preds, dim=1)
-        expert_weight = F.softmax(self.expert_logits, dim=0)
-        output = (pred_stack * expert_weight.view(1, -1, 1, 1)).sum(dim=1)
-
+        output = pred_stack.mean(dim=1)
         info = {
             "expert_names": self.expert_names,
-            "expert_weight": expert_weight,
             "pred_by_expert": pred_by_expert,
             "pred_stack": pred_stack,
         }
@@ -535,19 +329,15 @@ class MultiExpertHeadFusion(nn.Module):
             raise ValueError("flag must be either 'train' or 'test'.")
 
         target = self._get_target(batch)
-        main_loss = self.loss_func(output, target)
-        aux_losses = torch.stack(
+        head_losses = torch.stack(
             [self.loss_func(pred_by_expert[name], target) for name in self.expert_names]
         )
-        aux_loss = aux_losses.mean()
-        loss = main_loss + self.aux_loss_weight * aux_loss
-
+        loss = head_losses.mean()
         info.update(
             {
-                "main_loss": main_loss.detach(),
-                "aux_loss": aux_loss.detach(),
-                "aux_losses": {
-                    name: aux_losses[i].detach()
+                "head_loss": loss.detach(),
+                "head_losses": {
+                    name: head_losses[i].detach()
                     for i, name in enumerate(self.expert_names)
                 },
             }
@@ -558,4 +348,6 @@ class MultiExpertHeadFusion(nn.Module):
         return output, loss
 
 
-FusionModel = ExpertHeadReconstruction
+ExpertHeadReconstruction = ExpertPredictionHeads
+MultiExpertHeadFusion = ExpertPredictionHeads
+FusionModel = ExpertPredictionHeads
