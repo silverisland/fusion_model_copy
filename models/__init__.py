@@ -5,11 +5,17 @@ from .factory import (
     fusion_version_choices,
     get_fusion_model_class,
 )
-from .fusion import ExpertHeadReconstruction, ExpertPredictionHeads, FusionModel
+from .fusion import (
+    ExpertHeadReconstruction,
+    ExpertPredictionHeads,
+    FusionModel,
+    JointExpertPredictionHeads,
+)
 
 __all__ = [
     "FusionModel",
     "ExpertPredictionHeads",
+    "JointExpertPredictionHeads",
     "ExpertHeadReconstruction",
     "FusionModelWithExperts",
     "FUSION_REGISTRY",

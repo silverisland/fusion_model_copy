@@ -27,6 +27,13 @@ FUSION_EXPERIMENT_ARGS = [
         "help": "prediction-head loss type",
     },
     {
+        "name": "--fusion_head_train_mode",
+        "type": str,
+        "default": "round_robin",
+        "choices": ["round_robin", "joint"],
+        "help": "prediction-head training mode: round_robin trains one head per batch; joint trains all heads per batch",
+    },
+    {
         "name": "--fusion_unfreeze_epoch",
         "type": int,
         "default": -1,
@@ -44,6 +51,7 @@ FUSION_EXPERIMENT_ARGS = [
 SETTING_EXPERIMENT_COMPONENTS = [
     {"template": "_loss{value}", "attr": "fusion_loss"},
     {"template": "_drop{value}", "attr": "fusion_dropout"},
+    {"template": "_headmode{value}", "attr": "fusion_head_train_mode"},
     {
         "template": "_unfreeze{0}x{1}",
         "attrs": ["fusion_unfreeze_epoch", "fusion_expert_lr_scale"],
@@ -102,7 +110,7 @@ def main():
     parser.add_argument('--model', type=str, required=True, default='FusionModel',
                         help='model name, options: [FusionModel, DLinear, PatchTST, iTransformer, TimesNet]')
     parser.add_argument('--fusion_version', type=str, default='expert_head',
-                        choices=['expert_head'],
+                        choices=['expert_head', 'expert_head_joint'],
                         help='fusion model version selected by models/factory.py')
     parser.add_argument('--fusion_expert_names', type=str, default=None,
                         help="comma-separated experts to train, e.g. 'm1,m2,m4'; default uses all four")

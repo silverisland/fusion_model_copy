@@ -4,15 +4,18 @@ import torch
 import torch.nn as nn
 
 from .fusion.expert_head import ExpertPredictionHeads
+from .fusion.expert_head_joint import JointExpertPredictionHeads
 
 
 FUSION_REGISTRY = {
     "expert_head": ExpertPredictionHeads,
+    "expert_head_joint": JointExpertPredictionHeads,
 }
 
 DEFAULT_FUSION_VERSION = "expert_head"
 HIDDEN_ONLY_FUSION_VERSIONS = {
     "expert_head",
+    "expert_head_joint",
 }
 
 

@@ -4,10 +4,12 @@ from .expert_head import (
     FusionModel,
     MultiExpertHeadFusion,
 )
+from .expert_head_joint import JointExpertPredictionHeads
 
 __all__ = [
     "FusionModel",
     "ExpertPredictionHeads",
+    "JointExpertPredictionHeads",
     "ExpertHeadReconstruction",
     "MultiExpertHeadFusion",
 ]

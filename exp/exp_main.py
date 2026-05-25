@@ -83,6 +83,11 @@ class Exp_Main(Exp_Basic):
         return model.fusion_model if hasattr(model, "fusion_model") else model
 
     def _round_robin_expert_names(self):
+        if getattr(self.args, "fusion_version", "expert_head") != "expert_head":
+            return []
+        if getattr(self.args, "fusion_head_train_mode", "round_robin") != "round_robin":
+            return []
+
         fusion_model = self._fusion_module()
         if not hasattr(fusion_model, "set_active_expert"):
             return []
