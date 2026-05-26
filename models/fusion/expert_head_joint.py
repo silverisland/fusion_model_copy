@@ -5,6 +5,9 @@ import torch.nn.functional as F
 from layers.revin import RevIN
 
 
+EXPERT_MASK_PROB = 0.25
+
+
 class M1JointPredictionHead(nn.Module):
     # M1 hidden shape: (B, 9, 128)
     def __init__(
@@ -133,7 +136,8 @@ class JointExpertPredictionHeads(nn.Module):
     This module is independent from `models/fusion/expert_head.py`. It trains
     all configured expert prediction heads on every batch and returns the mean
     prediction as the default forecast. It has no active-expert routing and no
-    learned fusion gate.
+    learned fusion gate. During training, EXPERT_MASK_PROB controls stochastic
+    per-sample expert masking for augmentation.
     """
 
     DEFAULT_EXPERT_DIMS = {"m1": 128, "m2": 512, "m3": 384, "m4": 256}
@@ -158,9 +162,11 @@ class JointExpertPredictionHeads(nn.Module):
         self.n_features = n_features
         self.target_key = target_key
         self.loss_type = loss_type
+        self.expert_mask_prob = EXPERT_MASK_PROB
         self.expert_names = self._resolve_expert_names(models_dict, expert_names)
 
         self._validate_loss_type(loss_type)
+        self._validate_expert_mask_prob(self.expert_mask_prob)
         resolved_dims = self._resolve_hidden_dims(expert_dims)
 
         self.pv_revin_layer = RevIN(1, affine=1, subtract_last=0)
@@ -182,6 +188,15 @@ class JointExpertPredictionHeads(nn.Module):
         if loss_type not in cls.SUPPORTED_LOSSES:
             valid = ", ".join(sorted(cls.SUPPORTED_LOSSES))
             raise ValueError(f"Unknown loss_type={loss_type!r}. Valid: {valid}.")
+
+    @staticmethod
+    def _validate_expert_mask_prob(expert_mask_prob):
+        if expert_mask_prob is None:
+            return
+        if not 0.0 <= expert_mask_prob < 1.0:
+            raise ValueError(
+                f"expert_mask_prob must be in [0, 1), got {expert_mask_prob}."
+            )
 
     def _resolve_expert_names(self, models_dict, expert_names):
         if expert_names is not None:
@@ -290,7 +305,7 @@ class JointExpertPredictionHeads(nn.Module):
 
     def _get_expert_mask(self, batch, batch_size, device):
         if batch is None or "expert_mask" not in batch:
-            return None
+            return self._sample_expert_mask(batch_size, device)
 
         mask = batch["expert_mask"]
         if not torch.is_tensor(mask):
@@ -323,6 +338,27 @@ class JointExpertPredictionHeads(nn.Module):
         if all_masked.any():
             mask = mask.clone()
             mask[all_masked] = 1.0
+        return mask
+
+    def _sample_expert_mask(self, batch_size, device):
+        if not self.training or not self.expert_mask_prob:
+            return None
+
+        expert_count = len(self.expert_names)
+        keep_prob = 1.0 - self.expert_mask_prob
+        mask = torch.bernoulli(
+            torch.full((batch_size, expert_count), keep_prob, device=device)
+        )
+
+        all_masked = mask.sum(dim=1) == 0
+        if all_masked.any():
+            mask[all_masked] = 0.0
+            keep_index = torch.randint(
+                expert_count,
+                (int(all_masked.sum().item()),),
+                device=device,
+            )
+            mask[all_masked.nonzero(as_tuple=True)[0], keep_index] = 1.0
         return mask
 
     def _set_revin_statistics(self, batch):
@@ -413,7 +449,10 @@ class JointExpertPredictionHeads(nn.Module):
         if expert_mask is None:
             loss = per_sample_head_losses.mean()
         else:
-            loss = (per_sample_head_losses * expert_mask).sum() / expert_mask.sum().clamp_min(1.0)
+            loss = (
+                (per_sample_head_losses * expert_mask).sum()
+                / expert_mask.sum().clamp_min(1.0)
+            )
         head_losses = per_sample_head_losses.mean(dim=0)
         info.update(
             {
