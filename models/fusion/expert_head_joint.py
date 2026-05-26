@@ -6,6 +6,7 @@ from layers.revin import RevIN
 
 
 EXPERT_MASK_PROB = 0.25
+QUANTILE_LEVEL = 0.5
 
 
 class M1JointPredictionHead(nn.Module):
@@ -141,7 +142,7 @@ class JointExpertPredictionHeads(nn.Module):
     """
 
     DEFAULT_EXPERT_DIMS = {"m1": 128, "m2": 512, "m3": 384, "m4": 256}
-    SUPPORTED_LOSSES = {"mse", "mae", "huber", "rmse"}
+    SUPPORTED_LOSSES = {"mse", "mae", "huber", "rmse", "quantile"}
 
     def __init__(
         self,
@@ -163,10 +164,12 @@ class JointExpertPredictionHeads(nn.Module):
         self.target_key = target_key
         self.loss_type = loss_type
         self.expert_mask_prob = EXPERT_MASK_PROB
+        self.quantile_level = QUANTILE_LEVEL
         self.expert_names = self._resolve_expert_names(models_dict, expert_names)
 
         self._validate_loss_type(loss_type)
         self._validate_expert_mask_prob(self.expert_mask_prob)
+        self._validate_quantile_level(self.quantile_level)
         resolved_dims = self._resolve_hidden_dims(expert_dims)
 
         self.pv_revin_layer = RevIN(1, affine=1, subtract_last=0)
@@ -196,6 +199,13 @@ class JointExpertPredictionHeads(nn.Module):
         if not 0.0 <= expert_mask_prob < 1.0:
             raise ValueError(
                 f"expert_mask_prob must be in [0, 1), got {expert_mask_prob}."
+            )
+
+    @staticmethod
+    def _validate_quantile_level(quantile_level):
+        if not 0.0 < quantile_level < 1.0:
+            raise ValueError(
+                f"quantile_level must be in (0, 1), got {quantile_level}."
             )
 
     def _resolve_expert_names(self, models_dict, expert_names):
@@ -287,6 +297,8 @@ class JointExpertPredictionHeads(nn.Module):
             return F.l1_loss(pred, target)
         if self.loss_type == "huber":
             return F.huber_loss(pred, target, delta=1.0)
+        if self.loss_type == "quantile":
+            return self.quantile_loss(pred, target).mean()
         raise ValueError(f"Unknown loss_type={self.loss_type!r}")
 
     def loss_func_per_sample(self, pred, target):
@@ -301,7 +313,16 @@ class JointExpertPredictionHeads(nn.Module):
             return F.huber_loss(pred, target, delta=1.0, reduction="none").mean(
                 dim=loss_dims
             )
+        if self.loss_type == "quantile":
+            return self.quantile_loss(pred, target).mean(dim=loss_dims)
         raise ValueError(f"Unknown loss_type={self.loss_type!r}")
+
+    def quantile_loss(self, pred, target):
+        error = target - pred
+        return torch.maximum(
+            self.quantile_level * error,
+            (self.quantile_level - 1.0) * error,
+        )
 
     def _get_expert_mask(self, batch, batch_size, device):
         if batch is None or "expert_mask" not in batch:

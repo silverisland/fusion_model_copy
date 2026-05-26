@@ -23,7 +23,7 @@ FUSION_EXPERIMENT_ARGS = [
         "name": "--fusion_loss",
         "type": str,
         "default": None,
-        "choices": ["mse", "mae", "huber", "rmse"],
+        "choices": ["mse", "mae", "huber", "rmse", "quantile"],
         "help": "prediction-head loss type",
     },
     {

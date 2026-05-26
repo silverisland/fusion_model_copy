@@ -5,6 +5,9 @@ import torch.nn.functional as F
 from layers.revin import RevIN
 
 
+QUANTILE_LEVEL = 0.5
+
+
 class M1PredictionHead(nn.Module):
     # M1 hidden shape: (B, 9, 128)
     def __init__(
@@ -140,7 +143,7 @@ class ExpertPredictionHeads(nn.Module):
     """
 
     DEFAULT_EXPERT_DIMS = {"m1": 128, "m2": 512, "m3": 384, "m4": 256}
-    SUPPORTED_LOSSES = {"mse", "mae", "huber", "rmse"}
+    SUPPORTED_LOSSES = {"mse", "mae", "huber", "rmse", "quantile"}
 
     def __init__(
         self,
@@ -161,9 +164,11 @@ class ExpertPredictionHeads(nn.Module):
         self.n_features = n_features
         self.target_key = target_key
         self.loss_type = loss_type
+        self.quantile_level = QUANTILE_LEVEL
         self.expert_names = self._resolve_expert_names(models_dict, expert_names)
 
         self._validate_loss_type(loss_type)
+        self._validate_quantile_level(self.quantile_level)
         resolved_dims = self._resolve_hidden_dims(expert_dims)
 
         self.pv_revin_layer = RevIN(1, affine=1, subtract_last=0)
@@ -198,6 +203,13 @@ class ExpertPredictionHeads(nn.Module):
         if loss_type not in cls.SUPPORTED_LOSSES:
             valid = ", ".join(sorted(cls.SUPPORTED_LOSSES))
             raise ValueError(f"Unknown loss_type={loss_type!r}. Valid: {valid}.")
+
+    @staticmethod
+    def _validate_quantile_level(quantile_level):
+        if not 0.0 < quantile_level < 1.0:
+            raise ValueError(
+                f"quantile_level must be in (0, 1), got {quantile_level}."
+            )
 
     def _resolve_expert_names(self, models_dict, expert_names):
         if expert_names is not None:
@@ -286,7 +298,16 @@ class ExpertPredictionHeads(nn.Module):
             return F.l1_loss(pred, target)
         if self.loss_type == "huber":
             return F.huber_loss(pred, target, delta=1.0)
+        if self.loss_type == "quantile":
+            return self.quantile_loss(pred, target).mean()
         raise ValueError(f"Unknown loss_type={self.loss_type!r}")
+
+    def quantile_loss(self, pred, target):
+        error = target - pred
+        return torch.maximum(
+            self.quantile_level * error,
+            (self.quantile_level - 1.0) * error,
+        )
 
     def _set_revin_statistics(self, batch):
         if batch is None:
