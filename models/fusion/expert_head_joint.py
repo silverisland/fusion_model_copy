@@ -6,7 +6,7 @@ from layers.revin import RevIN
 
 
 EXPERT_MASK_PROB = 0.25
-QUANTILE_LEVEL = 0.5
+QUANTILE_LEVELS = tuple(round(i / 10, 1) for i in range(1, 10))
 
 
 class M1JointPredictionHead(nn.Module):
@@ -164,13 +164,19 @@ class JointExpertPredictionHeads(nn.Module):
         self.target_key = target_key
         self.loss_type = loss_type
         self.expert_mask_prob = EXPERT_MASK_PROB
-        self.quantile_level = QUANTILE_LEVEL
+        self.quantile_levels = QUANTILE_LEVELS
+        self.quantile_count = len(self.quantile_levels)
         self.expert_names = self._resolve_expert_names(models_dict, expert_names)
 
         self._validate_loss_type(loss_type)
         self._validate_expert_mask_prob(self.expert_mask_prob)
-        self._validate_quantile_level(self.quantile_level)
+        self._validate_quantile_levels(self.quantile_levels)
         resolved_dims = self._resolve_hidden_dims(expert_dims)
+        head_pred_len = (
+            pred_len * self.quantile_count
+            if loss_type == "quantile"
+            else pred_len
+        )
 
         self.pv_revin_layer = RevIN(1, affine=1, subtract_last=0)
         self.prediction_heads = nn.ModuleDict()
@@ -179,7 +185,7 @@ class JointExpertPredictionHeads(nn.Module):
             self.prediction_heads[name] = head_cls(
                 hidden_dim=resolved_dims[name],
                 seq_len=seq_len,
-                pred_len=pred_len,
+                pred_len=head_pred_len,
                 n_features=n_features,
                 head_dropout=dropout,
             )
@@ -202,10 +208,14 @@ class JointExpertPredictionHeads(nn.Module):
             )
 
     @staticmethod
-    def _validate_quantile_level(quantile_level):
-        if not 0.0 < quantile_level < 1.0:
+    def _validate_quantile_levels(quantile_levels):
+        if not quantile_levels:
+            raise ValueError("quantile_levels must not be empty.")
+        invalid = [q for q in quantile_levels if not 0.0 < q < 1.0]
+        if invalid:
             raise ValueError(
-                f"quantile_level must be in (0, 1), got {quantile_level}."
+                "quantile_levels must be in (0, 1), got: "
+                + ", ".join(str(q) for q in invalid)
             )
 
     def _resolve_expert_names(self, models_dict, expert_names):
@@ -250,6 +260,42 @@ class JointExpertPredictionHeads(nn.Module):
         return resolved_dims
 
     def _format_output(self, output):
+        if self.loss_type == "quantile":
+            if output.dim() == 2:
+                expected_width = (
+                    self.quantile_count * self.n_features * self.pred_len
+                )
+                if output.shape[1] != expected_width:
+                    raise ValueError(
+                        f"Quantile prediction head output width must be "
+                        f"{expected_width}, got {output.shape[1]}."
+                    )
+                return output.view(
+                    output.shape[0],
+                    self.quantile_count,
+                    self.n_features,
+                    self.pred_len,
+                )
+            if output.dim() == 4:
+                expected_shape = (
+                    output.shape[0],
+                    self.quantile_count,
+                    self.n_features,
+                    self.pred_len,
+                )
+                if tuple(output.shape) != expected_shape:
+                    raise ValueError(
+                        f"Quantile prediction head output must be "
+                        f"{expected_shape}, got {tuple(output.shape)}."
+                    )
+                return output
+            raise ValueError(
+                "Quantile prediction head output must be shaped "
+                f"(B, {self.quantile_count * self.n_features * self.pred_len}) "
+                f"or (B, {self.quantile_count}, {self.n_features}, {self.pred_len}), "
+                f"got {tuple(output.shape)}."
+            )
+
         if output.dim() == 2:
             output = output.unsqueeze(1)
         elif output.dim() == 3 and output.shape[1] == self.pred_len:
@@ -314,14 +360,20 @@ class JointExpertPredictionHeads(nn.Module):
                 dim=loss_dims
             )
         if self.loss_type == "quantile":
-            return self.quantile_loss(pred, target).mean(dim=loss_dims)
+            return self.quantile_loss(pred, target).mean(dim=(1, 2, 3))
         raise ValueError(f"Unknown loss_type={self.loss_type!r}")
 
     def quantile_loss(self, pred, target):
+        if pred.dim() != 4:
+            raise ValueError(
+                f"Quantile pred must be shaped (B, Q, C, P), got {tuple(pred.shape)}."
+            )
+        target = target.unsqueeze(1)
+        quantiles = pred.new_tensor(self.quantile_levels).view(1, -1, 1, 1)
         error = target - pred
         return torch.maximum(
-            self.quantile_level * error,
-            (self.quantile_level - 1.0) * error,
+            quantiles * error,
+            (quantiles - 1.0) * error,
         )
 
     def _get_expert_mask(self, batch, batch_size, device):
@@ -395,6 +447,23 @@ class JointExpertPredictionHeads(nn.Module):
         self.pv_revin_layer(pv, "norm")
 
     def _denorm_output(self, output):
+        if output.dim() == 4:
+            output = output.permute(0, 1, 3, 2)
+            if self.pv_revin_layer.affine:
+                output = output - self.pv_revin_layer.affine_bias.view(1, 1, 1, -1)
+                output = output / (
+                    self.pv_revin_layer.affine_weight.view(1, 1, 1, -1)
+                    + self.pv_revin_layer.eps * self.pv_revin_layer.eps
+                )
+            output = output * self.pv_revin_layer.stdev.unsqueeze(1)
+            if self.pv_revin_layer.subtract_last:
+                output = output + self.pv_revin_layer.last.unsqueeze(1)
+            else:
+                output = output + self.pv_revin_layer.mean.unsqueeze(1)
+            if output.shape[-1] != self.n_features:
+                output = output[..., : self.n_features]
+            return output.permute(0, 1, 3, 2)
+
         output = output.permute(0, 2, 1)
         output = self.pv_revin_layer(output, "denorm")
         if output.shape[-1] != self.n_features:
@@ -440,13 +509,20 @@ class JointExpertPredictionHeads(nn.Module):
                 dim=1,
                 keepdim=True,
             ).clamp_min(1.0)
-            output = (pred_stack * normalized_mask[:, :, None, None]).sum(dim=1)
+            if pred_stack.dim() == 5:
+                output = (pred_stack * normalized_mask[:, :, None, None, None]).sum(dim=1)
+            else:
+                output = (pred_stack * normalized_mask[:, :, None, None]).sum(dim=1)
 
         info = {
             "expert_names": self.expert_names,
             "pred_by_expert": pred_by_expert,
             "pred_stack": pred_stack,
         }
+        if self.loss_type == "quantile":
+            info["quantile_levels"] = self.quantile_levels
+            info["quantile_output"] = output
+            output = output.mean(dim=1)
         if expert_mask is not None:
             info["expert_mask"] = expert_mask
             info["normalized_expert_mask"] = normalized_mask
